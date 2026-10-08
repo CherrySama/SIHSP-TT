@@ -1,0 +1,3131 @@
+"""Tests for script entry-point utilities (pure functions and Hydra config defaults).
+
+Coverage targets:
+  - train_offpolicy.py: Hydra defaults, default_device(), resolve_checkpoint_path()
+  - play_interactive.py: resolve_checkpoint()                       (skipped if mujoco absent)
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import sys
+import types
+from pathlib import Path
+from typing import Any, cast
+from unittest.mock import MagicMock
+
+import numpy as np
+import pytest
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
+from omegaconf import OmegaConf
+from unisim.backend.motrix.playback import run_motrix_playback
+
+_SCRIPTS_DIR = Path(__file__).parent.parent.parent / "scripts"
+_PACKAGE_SCRIPTS_DIR = Path(__file__).parent.parent.parent / "src" / "unilab" / "scripts"
+_CONF_DIR = Path(__file__).parent.parent.parent / "src" / "unilab" / "conf"
+_SRC_DIR = Path(__file__).parent.parent.parent / "src"
+
+# CPU-bound on the single-core CI runner; kept in the slow lane (make test-slow).
+pytestmark = pytest.mark.slow
+
+
+def _normalize_overrides(overrides: list[str] | None, *, offpolicy: bool = False) -> list[str]:
+    normalized: list[str] = []
+    task_selected = False
+
+    for override in overrides or []:
+        if override.startswith("task="):
+            task_selected = True
+        normalized.append(override)
+
+    if not task_selected:
+        if offpolicy:
+            normalized.append("task=g1_walk_flat/mujoco")
+        else:
+            normalized.append("task=go2_joystick_flat/mujoco")
+    return normalized
+
+
+def _load_script(name: str) -> Any:
+    """Load a scripts/<name>.py as a fresh module (no __init__ required).
+
+    Packaged entrypoints live in ``src/unilab/scripts``; the remaining
+    development scripts stay in the top-level ``scripts`` directory.
+    """
+    for base in (_PACKAGE_SCRIPTS_DIR, _SCRIPTS_DIR):
+        path = base / f"{name}.py"
+        if path.is_file():
+            break
+    else:
+        raise FileNotFoundError(f"No script named {name}.py in packaged or top-level scripts")
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    return mod
+
+
+def test_analyze_offpolicy_trace_reports_training_e2e(tmp_path, capsys):
+    trace_path = tmp_path / "trace.json"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    {"name": "learner/wait_for_data", "ph": "X", "ts": 0.0, "dur": 10.0},
+                    {"name": "learner/wait_for_data", "ph": "X", "ts": 1000.0, "dur": 10.0},
+                    {"name": "learner/training_e2e", "ph": "X", "ts": 0.0, "dur": 2500.0},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    mod = _load_script("analyze_offpolicy_trace")
+
+    mod.analyze_training_e2e(trace_path)
+
+    out = capsys.readouterr().out
+    assert "training_e2e: n=1 mean=2.500ms" in out
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+try:
+    import mujoco  # noqa: F401
+
+    _HAS_MUJOCO = True
+except ImportError:
+    _HAS_MUJOCO = False
+
+# ---------------------------------------------------------------------------
+# train_sac.py / train_flashsac.py — Hydra config defaults
+# (composed from the per-algo trees conf/sac, conf/flashsac)
+# ---------------------------------------------------------------------------
+
+
+def _offpolicy_cfg(overrides=None, *, algo: str = "sac"):
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(config_dir=str(_CONF_DIR / algo), version_base="1.3"):
+        return compose(
+            "config",
+            overrides=_normalize_overrides(overrides, offpolicy=True),
+            return_hydra_config=True,
+        )
+
+
+def _ppo_cfg(overrides=None):
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(config_dir=str(_CONF_DIR / "ppo"), version_base="1.3"):
+        return compose("config", overrides=_normalize_overrides(overrides))
+
+
+def _appo_cfg(overrides=None):
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(config_dir=str(_CONF_DIR / "appo"), version_base="1.3"):
+        return compose("config", overrides=_normalize_overrides(overrides))
+
+
+def _train_rsl_rl(monkeypatch: pytest.MonkeyPatch):
+    import types
+
+    for module_name in list(sys.modules):
+        if module_name == "unilab" or module_name.startswith("unilab."):
+            monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+    runners_mod = cast(Any, types.ModuleType("rsl_rl.runners"))
+    runners_mod.OnPolicyRunner = object
+    rsl_pkg = cast(Any, types.ModuleType("rsl_rl"))
+    rsl_pkg.runners = runners_mod
+    monkeypatch.setitem(sys.modules, "rsl_rl", rsl_pkg)
+    monkeypatch.setitem(sys.modules, "rsl_rl.runners", runners_mod)
+    return _load_script("train_rsl_rl")
+
+
+def _train_appo():
+    return _load_script("train_appo")
+
+
+def test_offpolicy_hydra_default_algo():
+    cfg = _offpolicy_cfg()
+    assert cfg.algo.algo == "sac"
+
+
+def test_appo_runner_kwargs_forward_algorithm_seed():
+    mod = _train_appo()
+    cfg = _appo_cfg(["algo.seed=37"])
+    rl_cfg = OmegaConf.to_container(cfg.algo, resolve=True)
+
+    kwargs = mod.build_appo_runner_kwargs(
+        cfg,
+        env_cfg_override={"reward_config": {}},
+        collector_device="cpu",
+        rl_cfg=cast(dict[str, Any], rl_cfg),
+    )
+
+    assert kwargs["seed"] == 37
+
+
+def test_appo_runner_kwargs_default_load_run_does_not_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mod = _train_appo()
+    cfg = _appo_cfg(["task=allegro_inhand/mujoco", "algo.load_run=-1"])
+
+    def fail_resolve(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("training default load_run=-1 must not request resume")
+
+    monkeypatch.setattr(mod, "resolve_appo_checkpoint_path", fail_resolve)
+
+    kwargs = mod.build_appo_runner_kwargs(
+        cfg,
+        env_cfg_override={"reward_config": {}},
+        collector_device="cpu",
+    )
+
+    assert "resume_path" not in kwargs
+
+
+def test_appo_runner_kwargs_explicit_load_run_sets_resume_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mod = _train_appo()
+    cfg = _appo_cfg(["task=allegro_inhand/mujoco", "algo.load_run=run1"])
+    log_root = tmp_path / "logs" / "appo"
+    run_dir = log_root / cfg.training.task_name / "run1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "model_3.pt").write_bytes(b"")
+    (run_dir / "model_9.pt").write_bytes(b"")
+    monkeypatch.setattr(mod, "_get_log_root", lambda _cfg: str(log_root))
+
+    kwargs = mod.build_appo_runner_kwargs(
+        cfg,
+        env_cfg_override={"reward_config": {}},
+        collector_device="cpu",
+    )
+
+    assert kwargs["resume_path"] == str(run_dir / "model_9.pt")
+
+
+def test_appo_runner_kwargs_missing_explicit_load_run_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mod = _train_appo()
+    cfg = _appo_cfg(["task=allegro_inhand/mujoco", "algo.load_run=missing_run"])
+    monkeypatch.setattr(mod, "_get_log_root", lambda _cfg: str(tmp_path / "logs" / "appo"))
+
+    with pytest.raises(FileNotFoundError, match="missing_run"):
+        mod.build_appo_runner_kwargs(
+            cfg,
+            env_cfg_override={"reward_config": {}},
+            collector_device="cpu",
+        )
+
+
+def test_offpolicy_hydra_default_task():
+    cfg = _offpolicy_cfg()
+    assert cfg.training.task_name == "G1WalkFlat"
+
+
+def test_offpolicy_hydra_default_logger():
+    cfg = _offpolicy_cfg()
+    assert cfg.training.logger == "tensorboard"
+
+
+def test_offpolicy_hydra_default_wandb_fields():
+    cfg = _offpolicy_cfg()
+    assert cfg.training.wandb_project == "unilab"
+    assert cfg.training.wandb_entity is None
+    assert cfg.training.wandb_group is None
+    assert cfg.training.wandb_job_type is None
+    assert cfg.training.wandb_name is None
+    assert cfg.training.wandb_tags == []
+    assert cfg.training.wandb_notes is None
+    assert cfg.training.wandb_mode is None
+
+
+def test_offpolicy_hydra_default_sim_backend():
+    cfg = _offpolicy_cfg()
+    assert cfg.training.sim_backend == "mujoco"
+
+
+def test_ppo_hydra_default_wandb_fields():
+    cfg = _ppo_cfg()
+    assert cfg.training.wandb_project == "unilab"
+    assert cfg.training.wandb_entity is None
+    assert cfg.training.wandb_group is None
+    assert cfg.training.wandb_job_type is None
+    assert cfg.training.wandb_name is None
+    assert cfg.training.wandb_tags == []
+    assert cfg.training.wandb_notes is None
+    assert cfg.training.wandb_mode is None
+
+
+def test_offpolicy_hydra_default_play_flags():
+    cfg = _offpolicy_cfg()
+    assert cfg.training.play_only is False
+    assert cfg.training.no_play is False
+    assert cfg.training.export_onnx is True
+    assert cfg.algo.load_run == "-1"
+
+
+def test_offpolicy_hydra_default_trace_flags():
+    cfg = _offpolicy_cfg()
+    assert cfg.training.trace_enabled is False
+    assert cfg.training.trace_output_dir is None
+    assert cfg.training.trace_thread_time is False
+    assert cfg.training.trace_cuda_events is True
+    assert cfg.training.nvtx_profile_ranges is False
+    assert "verbose_metrics" not in cfg.training
+    assert "replay_pipeline" not in cfg.training
+    assert "replay_h2d_submitter" not in cfg.training
+
+
+def test_offpolicy_hydra_default_torch_thread_budget():
+    cfg = _offpolicy_cfg()
+    assert cfg.training.torch_threads.enabled is True
+    assert cfg.training.torch_threads.learner_num_threads == "auto"
+    assert cfg.training.torch_threads.collector_num_threads == "auto"
+    assert cfg.training.torch_threads.learner_num_interop_threads == 1
+    assert cfg.training.torch_threads.collector_num_interop_threads == 1
+    assert cfg.training.torch_threads.compile_threads == "auto"
+    assert cfg.training.torch_threads.set_env_vars is True
+
+
+def test_offpolicy_go2_motrix_task_is_not_configured():
+    """SAC has no Go2 Motrix owner config; use PPO for Go2 joystick tasks."""
+    from hydra.errors import MissingConfigException
+
+    with pytest.raises(MissingConfigException, match="task/go2_joystick_flat/motrix"):
+        _offpolicy_cfg(["task=go2_joystick_flat/motrix"])
+
+
+def test_offpolicy_g1_walk_flat_motrix_resolved_algo_matches_task_owner():
+    """Motrix SAC G1 walk flat composes backend-owned algo hyperparameters."""
+    cfg = _offpolicy_cfg(["task=g1_walk_flat/motrix"])
+
+    assert cfg.algo.num_envs == 2048
+    assert cfg.algo.max_iterations == 5000
+
+
+def test_offpolicy_g1_walk_flat_env_cfg_override_has_rewards_and_events():
+    cfg = _offpolicy_cfg(["task=g1_walk_flat/motrix"])
+
+    env_cfg_override = _offpolicy().build_offpolicy_env_cfg_override("sac", cfg)
+
+    assert env_cfg_override["rewards"]["tracking_lin_vel"]["weight"] == pytest.approx(2.2)
+    assert env_cfg_override["events"]["pd_gains"] is None
+
+
+@pytest.mark.parametrize(
+    ("backend", "field"),
+    [
+        ("isaacgym", "isaacgym_device_id"),
+        ("isaacsim", "isaacsim_device_id"),
+        ("genesis", "genesis_device_id"),
+    ],
+)
+def test_offpolicy_gpu_backend_env_follows_dp_rank(
+    monkeypatch: pytest.MonkeyPatch, backend: str, field: str
+) -> None:
+    """Off-policy collectors receive the host-visible rank device."""
+
+    mod = _offpolicy()
+    cfg = _offpolicy_cfg([f"task=g1_walk_flat/{backend}", "training.devices=[0,1]"])
+    monkeypatch.setenv("UNILAB_DP_RANK", "1")
+
+    override = mod.build_offpolicy_env_cfg_override("sac", cfg)
+
+    assert override is not None
+    assert override[field] == 1
+
+
+@pytest.mark.parametrize(
+    ("backend", "field"),
+    [
+        ("isaacgym", "isaacgym_device_id"),
+        ("isaacsim", "isaacsim_device_id"),
+        ("genesis", "genesis_device_id"),
+    ],
+)
+def test_ppo_gpu_backend_env_uses_torchrun_local_rank(
+    monkeypatch: pytest.MonkeyPatch, backend: str, field: str
+) -> None:
+    """PPO workers pass a local index after torchrun remaps CUDA visibility."""
+
+    mod = _train_rsl_rl(monkeypatch)
+    cfg = _ppo_cfg([f"task=g1_walk_flat/{backend}", "training.devices=[4,5]"])
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setenv("WORLD_SIZE", "2")
+
+    override = mod.build_ppo_env_cfg_override(cfg)
+
+    assert override[field] == 1
+
+
+def test_ppo_multi_rank_routes_one_cpu_partition_to_the_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mod = _train_rsl_rl(monkeypatch)
+    cfg = _ppo_cfg(["task=go2_joystick_flat/superdex", "training.devices=[0,1]"])
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setattr(
+        mod,
+        "resolve_collector_cpu_ids",
+        lambda world_size, rank, cpu_count, explicit=None: [8, 24],
+    )
+
+    override = mod.build_ppo_env_cfg_override(cfg)
+
+    assert override["cpu_ids"] == [8, 24]
+
+
+def test_offpolicy_isaacsim_training_and_eval_use_separate_render_overrides():
+    cfg = _offpolicy_cfg(
+        [
+            "task=g1_walk_flat/isaacsim",
+            "training.play_render_mode=record",
+        ]
+    )
+    mod = _offpolicy()
+
+    training_override = mod.build_offpolicy_env_cfg_override("sac", cfg)
+    play_override = mod.build_offpolicy_play_env_cfg_override("sac", cfg)
+
+    assert "isaacsim_render_mode" not in training_override
+    assert play_override["isaacsim_render_mode"] == "record"
+
+
+def test_ppo_go2_resolved_algo_matches_old_motrix_behavior():
+    """Equivalence: PPO Go2 algo hyperparams match pre-refactor motrix values."""
+    cfg = _ppo_cfg(["task=go2_joystick_flat/motrix"])
+
+    assert cfg.algo.max_iterations == 151
+    assert cfg.algo.actor.obs_normalization is True
+    assert cfg.algo.critic.obs_normalization is True
+    assert cfg.algo.actor.distribution_cfg.init_std == pytest.approx(0.5)
+    assert cfg.algo.algorithm.learning_rate == pytest.approx(3.0e-4)
+    assert cfg.algo.algorithm.entropy_coef == pytest.approx(1.0e-3)
+
+
+def test_ppo_g1_resolved_algo_matches_motrix_owner():
+    """Equivalence: PPO G1 algo hyperparams match the Motrix owner values.
+
+    For this migration we align with the final UniLab1 Motrix runtime.
+    """
+    cfg = _ppo_cfg(["task=g1_walk_flat/motrix"])
+
+    assert cfg.algo.max_iterations == 2200
+    assert cfg.algo.actor.obs_normalization is True
+    assert cfg.algo.critic.obs_normalization is True
+    assert cfg.algo.obs_groups.actor == ["policy"]
+    assert cfg.algo.actor.distribution_cfg.init_std == pytest.approx(0.5)
+    assert cfg.algo.algorithm.learning_rate == pytest.approx(3.0e-4)
+    assert cfg.algo.algorithm.entropy_coef == pytest.approx(5.0e-3)
+
+
+def test_ppo_g1_mujoco_base_hyperparams_remain_separate():
+    cfg = _ppo_cfg(["task=g1_walk_flat/mujoco"])
+
+    assert cfg.algo.max_iterations == 2200
+    assert cfg.algo.actor.obs_normalization is False
+    assert cfg.algo.critic.obs_normalization is False
+    assert cfg.algo.obs_groups.actor == ["actor"]
+
+
+def test_ppo_g1_env_preset_has_env_overrides():
+    cfg = _ppo_cfg(["task=g1_walk_flat/motrix"])
+
+    assert OmegaConf.select(cfg, "env.motrix_max_iterations") is None
+    assert cfg.env.actions.joint_pos.scale == pytest.approx(0.5)
+    assert cfg.env.commands.twist.ranges.lin_vel_x == [0.4, 0.7]
+    assert cfg.env.observations.policy.terms.gait_phase.params.init_mode == "offset_phase"
+    assert cfg.env.events.reset_root_state_uniform.params.velocity_range.x == [-0.05, 0.05]
+    assert cfg.reward.feet_phase_contrast.weight == pytest.approx(1.5)
+    assert cfg.reward.feet_phase_contact.weight == pytest.approx(1.0)
+    assert cfg.reward.feet_double_stance.weight == pytest.approx(-1.0)
+    assert cfg.reward.feet_phase.params.min_forward_speed == pytest.approx(0.05)
+
+
+def test_ppo_task_go2_aligns_mujoco_with_motrix_defaults():
+    cfg = _ppo_cfg(["task=go2_joystick_flat/mujoco"])
+
+    assert cfg.algo.num_envs == 1024
+    assert cfg.reward.tracking_lin_vel.weight == pytest.approx(1.0)
+    assert cfg.reward.tracking_ang_vel.weight == pytest.approx(0.2)
+    assert cfg.reward.lin_vel_z.weight == pytest.approx(-5.0)
+    assert cfg.reward.ang_vel_xy.weight == pytest.approx(-0.1)
+    assert cfg.algo.actor.obs_normalization is True
+    assert cfg.algo.critic.obs_normalization is True
+    assert cfg.algo.obs_groups.actor == ["actor"]
+    assert cfg.algo.obs_groups.critic == ["critic"]
+    assert cfg.algo.actor.distribution_cfg.init_std == pytest.approx(0.5)
+    assert cfg.algo.algorithm.learning_rate == pytest.approx(3.0e-4)
+    assert cfg.algo.algorithm.entropy_coef == pytest.approx(1.0e-3)
+
+
+def test_ppo_go2_drake_batch_config_matches_go2_training_defaults():
+    cfg = _ppo_cfg(["task=go2_joystick_flat/drake"])
+
+    assert cfg.training.task_name == "Go2JoystickFlat"
+    assert cfg.training.sim_backend == "drake"
+    assert cfg.algo.num_envs == 1024
+    assert cfg.algo.max_iterations == 151
+    assert cfg.algo.actor.obs_normalization is True
+    assert cfg.algo.critic.obs_normalization is True
+    assert cfg.algo.actor.distribution_cfg.init_std == pytest.approx(0.5)
+    assert cfg.algo.algorithm.learning_rate == pytest.approx(3.0e-4)
+    assert cfg.algo.algorithm.entropy_coef == pytest.approx(1.0e-3)
+    assert cfg.env.drake_backend_mode == "batch"
+    assert cfg.env.drake_nthread == 0
+    assert cfg.env.scene.model_file == "src/unilab/assets/robots/go2/scene_flat.xml"
+    assert cfg.env.events.pd_gains is None
+    # Contact reward disabled on drake: drake_uni reports world-frame net
+    # contact force, not contact-frame force (issue #1471).
+    assert cfg.reward.contact is None
+
+
+def test_build_ppo_env_cfg_override_go2_motrix(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mod = _train_rsl_rl(monkeypatch)
+    cfg = _ppo_cfg(["task=go2_joystick_flat/motrix"])
+
+    env_cfg_override = mod.build_ppo_env_cfg_override(cfg)
+
+    assert env_cfg_override["rewards"]["tracking_lin_vel"]["weight"] == pytest.approx(1.0)
+    assert env_cfg_override["rewards"]["contact"]["func"].endswith("feet_phase_contact")
+    assert env_cfg_override["commands"]["twist"]["ranges"] == {
+        "lin_vel_x": [0.5, 0.5],
+        "lin_vel_y": [0.0, 0.0],
+        "ang_vel_z": [0.0, 0.0],
+    }
+    assert env_cfg_override["events"]["pd_gains"] is None
+
+
+def test_build_ppo_env_cfg_override_g1_motrix(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mod = _train_rsl_rl(monkeypatch)
+    cfg = _ppo_cfg(["task=g1_walk_flat/motrix"])
+
+    env_cfg_override = mod.build_ppo_env_cfg_override(cfg)
+
+    # env_cfg_override has reward + env preset fields (flat, matching env cfg structure)
+    assert env_cfg_override["rewards"]["upper_body_pose"]["weight"] == pytest.approx(-0.05)
+    assert env_cfg_override["rewards"]["penalty_feet_ori"]["weight"] == pytest.approx(0.0)
+    assert env_cfg_override["rewards"]["feet_phase_contrast"]["weight"] == pytest.approx(1.5)
+    assert env_cfg_override["rewards"]["feet_phase_contact"]["weight"] == pytest.approx(1.0)
+    assert env_cfg_override["rewards"]["feet_double_stance"]["weight"] == pytest.approx(-1.0)
+    assert env_cfg_override["rewards"]["feet_phase"]["params"][
+        "min_forward_speed"
+    ] == pytest.approx(0.05)
+    assert "motrix_max_iterations" not in env_cfg_override
+    assert env_cfg_override["actions"]["joint_pos"]["scale"] == pytest.approx(0.5)
+    assert env_cfg_override["commands"]["twist"]["ranges"]["lin_vel_x"] == [0.4, 0.7]
+    assert env_cfg_override["events"]["pd_gains"] is None
+    assert env_cfg_override["events"]["reset_root_state_uniform"]["params"]["velocity_range"][
+        "x"
+    ] == [-0.05, 0.05]
+
+
+def test_build_ppo_env_cfg_override_carries_motrix_max_iterations_override(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mod = _train_rsl_rl(monkeypatch)
+    cfg = _ppo_cfg(["task=g1_walk_flat/motrix", "+env.motrix_max_iterations=9"])
+
+    env_cfg_override = mod.build_ppo_env_cfg_override(cfg)
+
+    assert env_cfg_override["motrix_max_iterations"] == 9
+
+
+def test_offpolicy_g1_walk_flat_motrix_env_cfg_override_disables_pd_gains():
+    cfg = _offpolicy_cfg(["task=g1_walk_flat/motrix"])
+
+    env_cfg_override = _offpolicy().build_offpolicy_env_cfg_override("sac", cfg)
+
+    assert env_cfg_override["events"]["pd_gains"] is None
+    assert env_cfg_override["rewards"]["tracking_lin_vel"]["weight"] == pytest.approx(2.2)
+
+
+def test_build_ppo_env_cfg_override_applies_go2_motrix_reward(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mod = _train_rsl_rl(monkeypatch)
+    cfg = _ppo_cfg(["task=go2_joystick_flat/motrix"])
+
+    env_cfg_override = mod.build_ppo_env_cfg_override(cfg)
+
+    assert cfg.reward.tracking_lin_vel.weight == pytest.approx(1.0)
+    assert cfg.algo.num_envs == 1024
+    assert env_cfg_override["events"]["pd_gains"] is None
+    assert env_cfg_override["rewards"]["tracking_lin_vel"]["weight"] == pytest.approx(1.0)
+    assert env_cfg_override["rewards"]["tracking_ang_vel"]["weight"] == pytest.approx(0.2)
+
+
+def test_build_ppo_env_cfg_override_allegro_mujoco(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mod = _train_rsl_rl(monkeypatch)
+    cfg = _ppo_cfg(["task=allegro_inhand/mujoco"])
+    ppo_motrix_cfg = _ppo_cfg(["task=allegro_inhand/motrix"])
+    ppo_drake_cfg = _ppo_cfg(["task=allegro_inhand/drake"])
+    appo_cfg = _appo_cfg(["task=allegro_inhand/mujoco"])
+    appo_motrix_cfg = _appo_cfg(["task=allegro_inhand/motrix"])
+    appo_drake_cfg = _appo_cfg(["task=allegro_inhand/drake"])
+
+    env_cfg_override = mod.build_ppo_env_cfg_override(cfg)
+
+    assert cfg.training.task_name == "AllegroInhandRotation"
+    assert cfg.algo.actor.obs_normalization is True
+    assert cfg.algo.critic.obs_normalization is True
+    assert env_cfg_override["rewards"]["rotate"]["weight"] == pytest.approx(1.25)
+    assert env_cfg_override["terminations"]["dropped"]["params"][
+        "minimum_ball_height"
+    ] == pytest.approx(0.125)
+    assert env_cfg_override["max_episode_seconds"] == pytest.approx(20.0)
+    reset_params = env_cfg_override["events"]["reset_hand_ball"]["params"]
+    assert reset_params["grasp_cache_path"] is None
+    assert reset_params["joint_noise"] == pytest.approx(0.0)
+    assert reset_params["ball_velocity_noise"] == pytest.approx(0.0)
+    assert reset_params["ball_z_offset"] == pytest.approx(0.0)
+    assert env_cfg_override["observations"]["policy"]["history_length"] == 3
+    assert env_cfg_override["actions"]["hand"]["action_scale"] == pytest.approx(1.0 / 24.0)
+    assert "reward_config" not in env_cfg_override
+    assert "domain_rand" not in env_cfg_override
+    assert appo_cfg.algo.steps_per_env == cfg.algo.num_steps_per_env
+    assert list(appo_cfg.algo.actor.hidden_dims) == list(cfg.algo.actor.hidden_dims)
+    assert appo_cfg.algo.actor.activation == cfg.algo.actor.activation
+    assert appo_cfg.algo.actor.obs_normalization is True
+    assert list(appo_cfg.algo.critic.hidden_dims) == list(cfg.algo.critic.hidden_dims)
+    assert appo_cfg.algo.critic.activation == cfg.algo.critic.activation
+    assert appo_cfg.algo.critic.obs_normalization is True
+    assert appo_cfg.algo.algorithm.value_loss_coef == pytest.approx(
+        cfg.algo.algorithm.value_loss_coef
+    )
+    assert appo_cfg.algo.algorithm.entropy_coef == pytest.approx(cfg.algo.algorithm.entropy_coef)
+    assert appo_cfg.algo.algorithm.num_learning_epochs == cfg.algo.algorithm.num_learning_epochs
+    assert appo_cfg.algo.algorithm.num_mini_batches == cfg.algo.algorithm.num_mini_batches
+    assert appo_cfg.algo.algorithm.clip_param == pytest.approx(cfg.algo.algorithm.clip_param)
+    assert appo_cfg.algo.algorithm.gamma == pytest.approx(cfg.algo.algorithm.gamma)
+    assert appo_cfg.algo.algorithm.lam == pytest.approx(cfg.algo.algorithm.lam)
+    assert appo_cfg.algo.algorithm.max_grad_norm == pytest.approx(cfg.algo.algorithm.max_grad_norm)
+    assert (
+        appo_cfg.algo.algorithm.use_clipped_value_loss is cfg.algo.algorithm.use_clipped_value_loss
+    )
+    assert appo_cfg.algo.algorithm.schedule == cfg.algo.algorithm.schedule
+    assert appo_motrix_cfg.training.task_name == appo_cfg.training.task_name
+    assert appo_motrix_cfg.training.sim_backend == ppo_motrix_cfg.training.sim_backend
+    assert appo_motrix_cfg.algo.actor.obs_normalization is True
+    assert appo_motrix_cfg.algo.critic.obs_normalization is True
+    assert appo_motrix_cfg.reward.rotate.weight == pytest.approx(
+        ppo_motrix_cfg.reward.rotate.weight
+    )
+    assert appo_motrix_cfg.env.events.pd_gains is None
+    assert ppo_motrix_cfg.env.events.pd_gains is None
+    assert ppo_drake_cfg.training.sim_backend == "drake"
+    assert appo_drake_cfg.training.sim_backend == "drake"
+    assert ppo_drake_cfg.env.events.pd_gains is None
+    assert appo_drake_cfg.env.events.pd_gains is None
+
+
+def test_build_ppo_env_cfg_override_allegro_grasp_mujoco(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mod = _train_rsl_rl(monkeypatch)
+    cfg = _ppo_cfg(["task=allegro_inhand_grasp/mujoco", "+env.grasp_collection_target=1"])
+
+    env_cfg_override = mod.build_ppo_env_cfg_override(cfg)
+
+    assert cfg.training.task_name == "AllegroInhandRotationGrasp"
+    assert cfg.algo.actor.obs_normalization is True
+    assert cfg.algo.critic.obs_normalization is True
+    assert env_cfg_override["rewards"]["rotate"]["weight"] == pytest.approx(0.0)
+    assert env_cfg_override["actions"]["hand"]["action_scale"] == pytest.approx(0.0)
+    reset = env_cfg_override["events"]["reset_hand_ball"]["params"]
+    assert reset["grasp_cache_path"] is None
+    assert reset["ball_velocity_noise"] == pytest.approx(0.0)
+    assert reset["joint_noise"] == pytest.approx(0.25)
+    quality = env_cfg_override["terminations"]["invalid_grasp"]["params"]
+    assert quality["enabled"] is True
+    assert quality["minimum_contacts"] == 2
+    recorder = env_cfg_override["recorders"]["grasp_cache"]["params"]
+    assert recorder["collection_target"] == 50000
+    assert recorder["auto_save"] is True
+    assert "reward_config" not in env_cfg_override
+    assert "domain_rand" not in env_cfg_override
+
+
+def test_build_ppo_env_cfg_override_allegro_grasp_cli_override_wins(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mod = _train_rsl_rl(monkeypatch)
+    cfg = _ppo_cfg(
+        [
+            "task=allegro_inhand_grasp/mujoco",
+            "algo.max_iterations=1",
+            "env.recorders.grasp_cache.params.collection_target=128",
+            "reward.rotate.weight=0.3",
+        ]
+    )
+
+    env_cfg_override = mod.build_ppo_env_cfg_override(cfg)
+
+    assert cfg.algo.max_iterations == 1
+    assert env_cfg_override["recorders"]["grasp_cache"]["params"]["collection_target"] == 128
+    assert env_cfg_override["rewards"]["rotate"]["weight"] == pytest.approx(0.3)
+
+
+@pytest.mark.parametrize("std_type", ["scalar", "log"])
+@pytest.mark.parametrize("state_dependent", [False, True])
+def test_rsl_action_std_logging_patch_delegates_with_detached_clone(
+    std_type: str,
+    state_dependent: bool,
+):
+    import torch
+    from rsl_rl.modules.distribution import (
+        GaussianDistribution,
+        HeteroscedasticGaussianDistribution,
+    )
+
+    from unilab.training.experiment import patch_rsl_rl_action_std_logging
+
+    captured: dict[str, Any] = {}
+    if state_dependent:
+        expected = torch.tensor([[0.25, 0.5], [0.4, 0.9]], requires_grad=True)
+        distribution = HeteroscedasticGaussianDistribution(output_dim=2, std_type=std_type)
+        std_head = expected if std_type == "scalar" else torch.log(expected)
+        distribution.update(torch.stack((torch.zeros_like(expected), std_head), dim=-2))
+        assert not hasattr(distribution, "std_param")
+        assert not hasattr(distribution, "log_std_param")
+    else:
+        expected = torch.full((2, 2), 0.5)
+        distribution = GaussianDistribution(output_dim=2, init_std=0.5, std_type=std_type)
+        distribution.update(torch.zeros_like(expected))
+
+    class Logger:
+        def log(self, *args, **kwargs):
+            captured["call"] = (args, kwargs)
+            return "logged"
+
+    runner = types.SimpleNamespace(
+        logger=Logger(),
+        alg=types.SimpleNamespace(
+            get_policy=lambda: types.SimpleNamespace(distribution=distribution)
+        ),
+    )
+
+    patch_rsl_rl_action_std_logging(runner)
+    result = runner.logger.log("payload", iteration=3)
+
+    assert result == "logged"
+    args, kwargs = captured["call"]
+    assert args == ("payload",)
+    assert kwargs["iteration"] == 3
+    action_std = kwargs["action_std"]
+    torch.testing.assert_close(action_std, expected)
+    assert action_std.requires_grad is False
+    assert action_std.data_ptr() != expected.data_ptr()
+
+
+def _build_rsl_lifecycle_case(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    learn_exception: Exception | None,
+    *,
+    run_complete: bool = False,
+    close_exception: Exception | None = None,
+    play_only: bool = False,
+) -> tuple[Any, Any, dict[str, Any], Exception | None]:
+    mod = _train_rsl_rl(monkeypatch)
+    if run_complete:
+        assert learn_exception is None
+        learn_exception = mod.RunComplete(
+            reason="grasp_collection_target_reached",
+            summary={"collected_grasps": 12, "status": "payload_must_not_override"},
+        )
+    cfg = _ppo_cfg(
+        [
+            "task=allegro_inhand_grasp/mujoco",
+            f"training.log_dir={tmp_path}",
+            "training.logger=none",
+            "training.nan_guard.enabled=false",
+            "training.no_play=false",
+            "training.play_render_mode=record",
+            f"training.play_only={str(play_only).lower()}",
+        ]
+    )
+    captured: dict[str, Any] = {
+        "env_create": 0,
+        "env_close": 0,
+        "distributed": [],
+        "summaries": [],
+        "tracker_finish": 0,
+        "playback": 0,
+    }
+
+    class FakeEnv:
+        num_envs = 1
+        play_capabilities = types.SimpleNamespace(supports_physics_state_playback=False)
+
+        def close(self) -> None:
+            captured["env_close"] += 1
+            if close_exception is not None:
+                raise close_exception
+
+    class FakeWrapper:
+        def __init__(self, env: Any, device: str) -> None:
+            del env, device
+
+    class FakeRunner:
+        logger = types.SimpleNamespace(
+            tot_timesteps=0,
+            tot_time=0.0,
+            rewbuffer=[],
+            lenbuffer=[],
+        )
+        current_learning_iteration = 3
+
+        def __init__(self, wrapped_env: Any, train_cfg: dict[str, Any], log_dir: str, device: str):
+            del wrapped_env, train_cfg, log_dir, device
+
+        def learn(self, **kwargs: Any) -> None:
+            captured["learn_kwargs"] = kwargs
+            if learn_exception is not None:
+                raise learn_exception
+            self.logger.tot_timesteps = 8
+            self.logger.tot_time = 2.0
+
+    class FakeTracker:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        def start(self) -> None:
+            captured["tracker_start"] = True
+
+        def update_summary(self, summary: dict[str, Any]) -> None:
+            captured["summaries"].append(summary)
+
+        def finish(self) -> None:
+            captured["tracker_finish"] += 1
+
+        def log_video(self, path: str | None) -> None:
+            captured["video"] = path
+
+    monkeypatch.setattr(mod, "resolve_dp_topology", lambda _devices: None)
+    monkeypatch.setattr(mod, "current_torch_distributed_rank", lambda: 0)
+    monkeypatch.setattr(mod, "current_torch_distributed_local_rank", lambda: 0)
+    monkeypatch.setattr(mod, "current_torch_distributed_world_size", lambda: 1)
+    monkeypatch.setattr(mod, "ensure_registries", lambda: None)
+    monkeypatch.setattr(mod, "apply_rsl_rl_rank_seed", lambda _cfg, _rank: 0)
+    monkeypatch.setattr(mod, "apply_configured_training_seed", lambda *args, **kwargs: {})
+    monkeypatch.setattr(mod, "build_ppo_env_cfg_override", lambda _cfg: {})
+    monkeypatch.setattr(mod, "get_default_device", lambda: "cpu")
+    monkeypatch.setattr(mod, "resolve_rsl_rl_device", lambda **kwargs: "cpu")
+    monkeypatch.setattr(mod, "resolve_ppo_log_dir", lambda _cfg, world_size: str(tmp_path))
+    monkeypatch.setattr(mod, "ExperimentTracker", FakeTracker)
+
+    def create_env(*args: Any, **kwargs: Any) -> FakeEnv:
+        del args, kwargs
+        captured["env_create"] += 1
+        return FakeEnv()
+
+    monkeypatch.setattr(mod, "create_env", create_env)
+    monkeypatch.setattr(mod, "algo_config_dict", lambda _cfg: {})
+    monkeypatch.setattr(mod, "RslRlVecEnvAdapter", FakeWrapper)
+    monkeypatch.setattr(mod, "patch_rsl_rl_resume_state", lambda: None)
+    monkeypatch.setattr(mod, "OnPolicyRunner", FakeRunner)
+    monkeypatch.setattr(mod, "patch_rsl_rl_action_std_logging", lambda _runner: None)
+    monkeypatch.setattr(
+        mod,
+        "finish_rsl_rl_distributed",
+        lambda *, training_succeeded: captured["distributed"].append(training_succeeded),
+    )
+
+    def playback(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        captured["playback"] += 1
+
+    monkeypatch.setattr(mod, "play_rsl_rl", playback)
+    return mod, cfg, captured, learn_exception
+
+
+@pytest.mark.parametrize("randomize_episode_lengths", [True, False])
+def test_train_rsl_rl_passes_task_owned_initial_episode_length_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, randomize_episode_lengths: bool
+) -> None:
+    mod, cfg, captured, _ = _build_rsl_lifecycle_case(monkeypatch, tmp_path, None)
+    cfg.training.init_at_random_ep_len = randomize_episode_lengths
+    cfg.training.no_play = True
+
+    assert mod.main.__wrapped__(cfg) is None
+    assert captured["learn_kwargs"]["init_at_random_ep_len"] is randomize_episode_lengths
+
+
+def test_train_rsl_rl_run_complete_closes_resources_and_skips_playback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    mod, cfg, captured, _ = _build_rsl_lifecycle_case(
+        monkeypatch,
+        tmp_path,
+        None,
+        run_complete=True,
+    )
+
+    assert mod.main.__wrapped__(cfg) is None
+    assert captured["env_close"] == 1
+    assert captured["distributed"] == [True]
+    assert captured["tracker_finish"] == 1
+    assert captured["playback"] == 0
+    assert captured["summaries"] == [
+        {
+            "collected_grasps": 12,
+            "status": "collection_completed",
+            "completion_reason": "grasp_collection_target_reached",
+        }
+    ]
+
+
+def test_train_rsl_rl_success_keeps_playback_and_single_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    mod, cfg, captured, raised = _build_rsl_lifecycle_case(monkeypatch, tmp_path, None)
+
+    assert raised is None
+    assert mod.main.__wrapped__(cfg) is None
+    assert captured["env_close"] == 1
+    assert captured["distributed"] == [True]
+    assert captured["tracker_finish"] == 1
+    assert captured["playback"] == 1
+    assert captured["summaries"][0]["status"] == "completed"
+    assert captured["summaries"][0]["run_env_steps"] == 8
+
+
+def test_train_rsl_rl_runtime_error_propagates_after_single_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    sentinel = RuntimeError("runner failed")
+    mod, cfg, captured, raised = _build_rsl_lifecycle_case(monkeypatch, tmp_path, sentinel)
+
+    with pytest.raises(RuntimeError) as caught:
+        mod.main.__wrapped__(cfg)
+
+    assert caught.value is raised is sentinel
+    assert captured["env_close"] == 1
+    assert captured["distributed"] == [False]
+    assert captured["tracker_finish"] == 1
+    assert captured["playback"] == 0
+    assert captured["summaries"] == []
+
+
+def test_train_rsl_rl_run_complete_close_error_is_not_misclassified(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    sentinel = RuntimeError("close failed")
+    mod, cfg, captured, _ = _build_rsl_lifecycle_case(
+        monkeypatch,
+        tmp_path,
+        None,
+        run_complete=True,
+        close_exception=sentinel,
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        mod.main.__wrapped__(cfg)
+
+    assert caught.value is sentinel
+    assert captured["env_close"] == 1
+    assert captured["distributed"] == [False]
+    assert captured["tracker_finish"] == 1
+    assert captured["playback"] == 0
+    assert captured["summaries"] == []
+
+
+def test_train_rsl_rl_play_only_keeps_single_cleanup_and_runs_playback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    mod, cfg, captured, raised = _build_rsl_lifecycle_case(
+        monkeypatch,
+        tmp_path,
+        None,
+        play_only=True,
+    )
+
+    assert raised is None
+    assert mod.main.__wrapped__(cfg) is None
+    assert captured["env_create"] == 0
+    assert captured["env_close"] == 0
+    assert captured["distributed"] == [False]
+    assert captured["tracker_finish"] == 0
+    assert captured["playback"] == 1
+    assert captured["summaries"] == []
+
+
+@pytest.mark.parametrize(
+    ("devices", "world_size"),
+    [
+        ((0, 1), 1),
+        (None, 2),
+    ],
+)
+def test_train_rsl_rl_grasp_collection_rejects_multi_rank_before_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    devices: tuple[int, ...] | None,
+    world_size: int,
+) -> None:
+    mod = _train_rsl_rl(monkeypatch)
+    cfg = _ppo_cfg(["task=allegro_inhand_grasp/mujoco", "+env.grasp_collection_target=1"])
+    monkeypatch.setattr(mod, "resolve_dp_topology", lambda _devices: devices)
+    monkeypatch.setattr(mod, "current_torch_distributed_rank", lambda: 0)
+    monkeypatch.setattr(mod, "current_torch_distributed_local_rank", lambda: 0)
+    monkeypatch.setattr(mod, "current_torch_distributed_world_size", lambda: world_size)
+    monkeypatch.setattr(
+        mod,
+        "launch_torchrun_workers",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must fail before launch")),
+    )
+    monkeypatch.setattr(
+        mod,
+        "ensure_registries",
+        lambda: (_ for _ in ()).throw(AssertionError("must fail before registry bootstrap")),
+    )
+
+    with pytest.raises(ValueError, match="requires one process"):
+        mod.main.__wrapped__(cfg)
+
+
+def test_ppo_cli_algo_override_wins_over_base(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """CLI override takes precedence over base task algo values via Hydra compose."""
+    cfg = _ppo_cfg(["task=g1_walk_flat/motrix", "algo.max_iterations=1"])
+
+    assert cfg.algo.max_iterations == 1
+    # Other base values remain intact
+    assert cfg.algo.actor.obs_normalization is True
+    assert cfg.algo.critic.obs_normalization is True
+
+
+def test_g1_motion_tracking_ppo_motrix_prefers_backend_specific_reward(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mod = _train_rsl_rl(monkeypatch)
+    cfg = _ppo_cfg(["task=g1_motion_tracking/motrix"])
+
+    assert cfg.reward.motion_body_pos.weight == pytest.approx(1.0)
+    cfg.reward.motion_body_pos.weight = 1.25
+
+    env_cfg_override = mod.build_ppo_env_cfg_override(cfg)
+
+    assert env_cfg_override["rewards"]["motion_body_pos"]["weight"] == pytest.approx(1.25)
+
+
+def test_build_ppo_play_env_cfg_override_applies_g1_motion_tracking_play_profile(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mod = _train_rsl_rl(monkeypatch)
+    cfg = _ppo_cfg(["task=g1_motion_tracking/motrix", "training.play_only=true"])
+    assert cfg.training.play_env_num == 16
+
+    monkeypatch.setattr(
+        mod,
+        "materialize_scene_visual_override",
+        lambda *_args, **_kwargs: pytest.fail("manager scene must not be replaced"),
+    )
+
+    env_cfg_override = mod.build_ppo_play_env_cfg_override(cfg)
+
+    assert cfg.training.play_env_num == 16
+    assert env_cfg_override["render_spacing"] == pytest.approx(2.5)
+    assert env_cfg_override["scene"]["model_file"].endswith("robots/g1/scene_flat.xml")
+    assert "robot" in env_cfg_override["scene"]["entities"]
+    assert env_cfg_override["rewards"]["motion_body_pos"]["weight"] == pytest.approx(1.0)
+
+
+def test_build_ppo_play_env_cfg_override_respects_cli_play_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mod = _train_rsl_rl(monkeypatch)
+    cfg = _ppo_cfg(
+        [
+            "task=g1_motion_tracking/motrix",
+            "training.play_only=true",
+            "training.play_env_num=32",
+        ]
+    )
+    assert cfg.training.play_env_num == 32
+    monkeypatch.setattr(
+        mod,
+        "materialize_scene_visual_override",
+        lambda source_model_file, **kwargs: "/tmp/g1_motion_tracking_play_scene.xml",
+    )
+
+    env_cfg_override = mod.build_ppo_play_env_cfg_override(cfg)
+
+    assert cfg.training.play_env_num == 32
+    assert env_cfg_override["render_spacing"] == pytest.approx(2.5)
+
+
+def test_build_ppo_play_env_cfg_override_keeps_task_owned_manager_scene(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mod = _train_rsl_rl(monkeypatch)
+    cfg = _ppo_cfg(["task=g1_motion_tracking/motrix", "training.play_only=true"])
+    monkeypatch.setattr(
+        mod,
+        "materialize_scene_visual_override",
+        lambda *_args, **_kwargs: pytest.fail("manager scene must not be replaced"),
+    )
+
+    env_cfg_override = mod.build_ppo_play_env_cfg_override(cfg)
+
+    assert env_cfg_override["scene"]["entities"]["robot"]["root_body_name"] == "pelvis"
+    assert env_cfg_override["scene"]["entities"]["robot"]["joint_names"]
+
+
+def test_run_motrix_rsl_play_loop_uses_render_spacing_and_offset_mode(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import torch
+    from tensordict import TensorDict
+
+    mod = _train_rsl_rl(monkeypatch)
+
+    class FakePolicy:
+        def __call__(self, obs):
+            batch = obs.batch_size[0]
+            return torch.zeros((batch, 3), dtype=torch.float32)
+
+    class FakeBackend:
+        def __init__(self):
+            self.init_renderer_calls = []
+            self.render_calls = 0
+
+        def init_renderer(self, spacing=1.0, offset_mode="grid"):
+            self.init_renderer_calls.append((spacing, offset_mode))
+
+        def render(self):
+            self.render_calls += 1
+
+    class FakeEnv:
+        def __init__(self):
+            self._renderer = FakeBackend()
+            self.cfg = type("Cfg", (), {"render_spacing": 2.5, "render_offset_mode": "zero"})()
+
+        def init_play_renderer(self, render_spacing=None, render_offset_mode=None):
+            offset_mode = "grid" if render_offset_mode is None else render_offset_mode
+            if render_spacing is None:
+                self._renderer.init_renderer(offset_mode=offset_mode)
+            else:
+                self._renderer.init_renderer(render_spacing, offset_mode=offset_mode)
+
+        def render_play_frame(self):
+            self._renderer.render()
+
+        def run_playback(self, **kwargs):
+            kwargs.pop("frame_state_getter", None)
+            kwargs.setdefault("output_video", None)
+            kwargs.setdefault("camera_kwargs", None)
+            return run_motrix_playback(
+                backend=self._renderer,
+                env=self,
+                headless=False if kwargs.get("headless") is None else bool(kwargs["headless"]),
+                record_video=(
+                    bool(kwargs["record_video"])
+                    if kwargs.get("record_video") is not None
+                    else kwargs.get("output_video") is not None
+                ),
+                **{k: v for k, v in kwargs.items() if k not in {"headless", "record_video"}},
+            )
+
+    class FakeWrapper:
+        def __init__(self):
+            self.env = FakeEnv()
+            self.reset_calls = 0
+            self.step_calls = 0
+
+        def reset(self):
+            self.reset_calls += 1
+            return TensorDict({"policy": torch.ones((2, 5), dtype=torch.float32)}, batch_size=2), {}
+
+        def step(self, actions):
+            self.step_calls += 1
+            return (
+                TensorDict({"policy": torch.ones((2, 5), dtype=torch.float32)}, batch_size=2),
+                torch.zeros((2,), dtype=torch.float32),
+                torch.zeros((2,), dtype=torch.bool),
+                {},
+            )
+
+    wrapped_env = FakeWrapper()
+
+    mod.run_motrix_rsl_play_loop(
+        wrapped_env=wrapped_env,
+        policy=FakePolicy(),
+        render_spacing=2.5,
+        render_offset_mode="zero",
+        num_steps=3,
+    )
+
+    assert wrapped_env.reset_calls == 1
+    assert wrapped_env.step_calls == 3
+    assert wrapped_env.env._renderer.init_renderer_calls == [(2.5, "zero")]
+    assert wrapped_env.env._renderer.render_calls == 3
+
+
+def test_g1_motion_tracking_appo_reward_extraction_prefers_backend_specific_reward():
+    from unilab.base.config_adapter import BackendAdapter
+
+    cfg = _appo_cfg(["task=g1_motion_tracking/motrix"])
+
+    assert cfg.reward.motion_body_pos.weight == pytest.approx(1.0)
+    cfg.reward.motion_body_pos.weight = 1.5
+
+    env_cfg_override = BackendAdapter(cfg, root_dir=_SRC_DIR.parent).build_task_env_cfg_override()
+
+    assert env_cfg_override["rewards"]["motion_body_pos"]["weight"] == pytest.approx(1.5)
+
+
+def test_g1_motion_tracking_ppo_task_exposes_final_reward():
+    cfg = _ppo_cfg(["task=g1_motion_tracking/motrix"])
+
+    assert cfg.reward.motion_body_pos.weight == pytest.approx(1.0)
+
+
+def test_g1_motion_tracking_appo_task_exposes_final_reward():
+    cfg = _appo_cfg(["task=g1_motion_tracking/motrix"])
+
+    assert cfg.reward.motion_body_pos.weight == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# train_appo.py — motrix runner / play helpers
+# ---------------------------------------------------------------------------
+
+
+def test_build_appo_runner_kwargs_forwards_sim_backend():
+    mod = _train_appo()
+    cfg = _appo_cfg(["task=g1_motion_tracking/motrix"])
+
+    runner_kwargs = mod.build_appo_runner_kwargs(
+        cfg,
+        env_cfg_override={"rewards": {}},
+        collector_device="cpu",
+    )
+
+    assert runner_kwargs["env_name"] == "G1MotionTracking"
+    assert runner_kwargs["sim_backend"] == "motrix"
+    assert runner_kwargs["collector_device"] == "cpu"
+    assert runner_kwargs["num_envs"] == cfg.algo.num_envs
+    assert runner_kwargs["steps_per_env"] == cfg.algo.steps_per_env
+    assert "num_workers" not in runner_kwargs
+    assert "num_collectors" not in runner_kwargs
+    assert runner_kwargs["env_cfg_overrides"]["rewards"] == {}
+
+
+def test_run_motrix_play_loop_runs_without_physics_state():
+    import numpy as np
+    import torch
+
+    mod = _train_appo()
+
+    class FakeActor:
+        def __call__(self, td):
+            batch = td.batch_size[0]
+            return torch.zeros((batch, 3), dtype=torch.float32)
+
+    class FakeBackend:
+        def __init__(self):
+            self.init_renderer_calls = 0
+            self.render_calls = 0
+
+        def init_renderer(self, spacing=1.0, offset_mode="grid", **kwargs):
+            del spacing, offset_mode, kwargs
+            self.init_renderer_calls += 1
+
+        def render(self):
+            self.render_calls += 1
+
+    class FakeState:
+        def __init__(self):
+            self.obs = {"obs": np.ones((2, 5), dtype=np.float32)}
+
+    class FakeEnv:
+        def __init__(self):
+            self.state = None
+            self._renderer = FakeBackend()
+            self.init_state_calls = 0
+            self.reset_calls = 0
+            self.step_calls = 0
+
+        def init_state(self):
+            self.init_state_calls += 1
+            self.state = object()
+
+        def reset(self, env_indices):
+            self.reset_calls += 1
+            assert env_indices.shape == (2,)
+            return {"obs": np.ones((2, 5), dtype=np.float32)}, {}
+
+        def step(self, actions):
+            self.step_calls += 1
+            assert actions.shape == (2, 3)
+            return FakeState()
+
+        def init_play_renderer(self, render_spacing=None, render_offset_mode=None):
+            del render_spacing, render_offset_mode
+            self._renderer.init_renderer()
+
+        def render_play_frame(self):
+            self._renderer.render()
+
+        def run_playback(self, **kwargs):
+            kwargs.pop("frame_state_getter", None)
+            kwargs.setdefault("output_video", None)
+            kwargs.setdefault("render_spacing", None)
+            kwargs.setdefault("render_offset_mode", None)
+            kwargs.setdefault("camera_kwargs", None)
+            return run_motrix_playback(
+                backend=self._renderer,
+                env=self,
+                headless=False if kwargs.get("headless") is None else bool(kwargs["headless"]),
+                record_video=(
+                    bool(kwargs["record_video"])
+                    if kwargs.get("record_video") is not None
+                    else kwargs.get("output_video") is not None
+                ),
+                **{k: v for k, v in kwargs.items() if k not in {"headless", "record_video"}},
+            )
+
+    env = FakeEnv()
+
+    mod.run_motrix_play_loop(
+        env=env,
+        actor=FakeActor(),
+        device="cpu",
+        play_env_num=2,
+        num_steps=3,
+    )
+
+    assert env.init_state_calls == 1
+    assert env.reset_calls == 1
+    assert env.step_calls == 3
+    assert env._renderer.init_renderer_calls == 1
+    assert env._renderer.render_calls == 3
+
+
+def test_resolve_appo_checkpoint_path_prefers_latest_model_in_explicit_dir(tmp_path):
+    mod = _train_appo()
+    run_dir = tmp_path / "logs" / "appo" / "MyTask" / "run1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "model_1.pt").write_bytes(b"")
+    (run_dir / "model_7.pt").write_bytes(b"")
+
+    checkpoint_path, checkpoint_dir = mod.resolve_appo_checkpoint_path(
+        base_log_dir=tmp_path / "logs" / "appo" / "MyTask",
+        load_run=str(run_dir),
+    )
+
+    assert checkpoint_path is not None
+    assert checkpoint_path.endswith("model_7.pt")
+    assert checkpoint_dir == str(run_dir)
+
+
+# ---------------------------------------------------------------------------
+# train_offpolicy.py — default_device()
+# ---------------------------------------------------------------------------
+
+
+def _offpolicy():
+    return _load_script("train_offpolicy")
+
+
+def test_offpolicy_default_device_preferred_cpu():
+    mock_torch = MagicMock()
+    assert _offpolicy().default_device(mock_torch, preferred="cpu") == "cpu"
+
+
+def test_offpolicy_default_device_preferred_cuda():
+    mock_torch = MagicMock()
+    assert _offpolicy().default_device(mock_torch, preferred="cuda") == "cuda"
+
+
+def test_offpolicy_default_device_cuda_available():
+    mock_torch = MagicMock()
+    mock_torch.cuda.is_available.return_value = True
+    assert _offpolicy().default_device(mock_torch) == "cuda"
+
+
+def test_offpolicy_default_device_mps_fallback():
+    mock_torch = MagicMock()
+    mock_torch.cuda.is_available.return_value = False
+    mock_torch.xpu.is_available.return_value = False
+    mock_torch.backends.mps.is_available.return_value = True
+    assert _offpolicy().default_device(mock_torch) == "mps"
+
+
+def test_offpolicy_default_device_xpu_before_mps():
+    mock_torch = MagicMock()
+    mock_torch.cuda.is_available.return_value = False
+    mock_torch.xpu.is_available.return_value = True
+    mock_torch.backends.mps.is_available.return_value = True
+    assert _offpolicy().default_device(mock_torch) == "xpu"
+
+
+def test_offpolicy_genesis_probe_para_level_restores_previous_value(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mod = _offpolicy()
+    monkeypatch.setenv("GS_PARA_LEVEL", "0")
+
+    with mod._genesis_probe_para_level("genesis"):
+        assert os.environ["GS_PARA_LEVEL"] == "2"
+
+    assert os.environ["GS_PARA_LEVEL"] == "0"
+
+
+def test_offpolicy_genesis_probe_para_level_restores_unset_variable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mod = _offpolicy()
+    monkeypatch.delenv("GS_PARA_LEVEL", raising=False)
+
+    with mod._genesis_probe_para_level("genesis"):
+        assert os.environ["GS_PARA_LEVEL"] == "2"
+
+    assert "GS_PARA_LEVEL" not in os.environ
+
+
+def test_offpolicy_genesis_probe_para_level_ignores_other_backends(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mod = _offpolicy()
+    monkeypatch.setenv("GS_PARA_LEVEL", "0")
+
+    with mod._genesis_probe_para_level("mujoco"):
+        assert os.environ["GS_PARA_LEVEL"] == "0"
+
+    assert os.environ["GS_PARA_LEVEL"] == "0"
+
+
+def test_offpolicy_default_device_cpu_fallback():
+    mock_torch = MagicMock()
+    mock_torch.cuda.is_available.return_value = False
+    mock_torch.xpu.is_available.return_value = False
+    mock_torch.backends.mps.is_available.return_value = False
+    assert _offpolicy().default_device(mock_torch) == "cpu"
+
+
+def test_offpolicy_enable_faulthandler_respects_disable_env(monkeypatch: pytest.MonkeyPatch):
+    mod = _offpolicy()
+    fake_faulthandler = types.SimpleNamespace(
+        is_enabled=lambda: False,
+        enable=MagicMock(),
+    )
+    monkeypatch.setitem(sys.modules, "faulthandler", fake_faulthandler)
+    monkeypatch.setenv("UNILAB_FAULTHANDLER", "0")
+
+    mod.enable_faulthandler()
+
+    fake_faulthandler.enable.assert_not_called()
+
+
+def test_offpolicy_enable_faulthandler_default_enables(monkeypatch: pytest.MonkeyPatch):
+    mod = _offpolicy()
+    fake_faulthandler = types.SimpleNamespace(
+        is_enabled=lambda: False,
+        enable=MagicMock(),
+    )
+    monkeypatch.setitem(sys.modules, "faulthandler", fake_faulthandler)
+    monkeypatch.delenv("UNILAB_FAULTHANDLER", raising=False)
+
+    mod.enable_faulthandler()
+
+    fake_faulthandler.enable.assert_called_once_with(all_threads=True)
+
+
+def test_offpolicy_build_failure_summary_preserves_failed_status():
+    mod = _offpolicy()
+    exc = RuntimeError("collector died")
+
+    summary = mod.build_failure_summary(exc, {"status": "collector_died", "total_env_steps": 12})
+
+    assert summary["status"] == "collector_died"
+    assert summary["total_env_steps"] == 12
+    assert summary["error_type"] == "RuntimeError"
+    assert summary["error"] == "collector died"
+
+
+def test_offpolicy_build_run_dir_name_uses_timestamp_and_backend():
+    mod = _offpolicy()
+
+    assert mod.build_run_dir_name("2026-06-22_22-31-24", "mujoco") == ("2026-06-22_22-31-24_mujoco")
+    assert (
+        mod.build_run_dir_name("2026-06-22_22-31-24", "mujoco", world_size=2)
+        == "2026-06-22_22-31-24_mujoco_gpux2"
+    )
+
+
+def test_offpolicy_main_failure_summary_and_skips_playback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    mod = _offpolicy()
+    cfg = _offpolicy_cfg(
+        [
+            f"training.log_dir={tmp_path}",
+            "training.no_play=false",
+            "training.play_render_mode=record",
+        ]
+    )
+    captured: dict[str, Any] = {"summaries": []}
+
+    class FakeTracker:
+        def __init__(self, **kwargs):
+            captured["tracker_kwargs"] = kwargs
+
+        def start(self):
+            captured["tracker_started"] = True
+
+        def update_summary(self, summary):
+            captured["summaries"].append(summary)
+
+        def log_video(self, path):
+            captured["video"] = path
+
+        def finish(self):
+            captured["tracker_finished"] = True
+
+    class FakeRunner:
+        last_run_summary = {"status": "collector_died", "total_env_steps": 12}
+
+        def learn(self, **kwargs):
+            del kwargs
+            raise RuntimeError("collector died")
+
+        def close(self):
+            captured["runner_closed"] = True
+
+    monkeypatch.setattr(mod, "enable_faulthandler", lambda: None)
+    monkeypatch.setattr(mod, "ensure_registries", lambda: None)
+    monkeypatch.setattr(mod, "apply_configured_training_seed", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        mod, "assert_offpolicy_task_choice_matches_algo", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(mod, "ExperimentTracker", FakeTracker)
+    monkeypatch.setattr(mod, "build_runner", lambda algo_name, cfg, log_dir=None: FakeRunner())
+    monkeypatch.setattr(
+        mod,
+        "play_offpolicy",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("playback must not run after training failure")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="collector died"):
+        mod.main(cfg)
+
+    assert captured["tracker_started"] is True
+    assert captured["tracker_finished"] is True
+    assert captured["runner_closed"] is True
+    assert len(captured["summaries"]) == 1
+    failure_summary = captured["summaries"][0]
+    assert failure_summary["status"] == "collector_died"
+    assert failure_summary["total_env_steps"] == 12
+    assert failure_summary["error_type"] == "RuntimeError"
+    assert failure_summary["error"] == "collector died"
+    assert "video" not in captured
+
+
+# ---------------------------------------------------------------------------
+# train_offpolicy.py — resolve_checkpoint_path()
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_checkpoint_no_base_dir(tmp_path):
+    """load_run='-1' with no log directory → (None, None)."""
+    path, path_dir = _offpolicy().resolve_checkpoint_path(tmp_path, "sac", "MyTask", "-1")
+    assert path is None
+    assert path_dir is None
+
+
+def test_resolve_checkpoint_explicit_existing_file(tmp_path):
+    """load_run = absolute path to existing .pt → returns that path."""
+    model_file = tmp_path / "model_100.pt"
+    model_file.write_bytes(b"")
+    path, path_dir = _offpolicy().resolve_checkpoint_path(
+        tmp_path, "sac", "MyTask", str(model_file)
+    )
+    assert path == str(model_file)
+    assert path_dir == str(tmp_path)
+
+
+def test_resolve_checkpoint_latest_picks_highest_iter(tmp_path):
+    """load_run='-1' picks model with numerically highest iteration."""
+    task_dir = tmp_path / "logs" / "sac" / "MyTask" / "run1"
+    task_dir.mkdir(parents=True)
+    (task_dir / "model_10.pt").write_bytes(b"")
+    (task_dir / "model_50.pt").write_bytes(b"")
+    (task_dir / "model_100.pt").write_bytes(b"")
+
+    path, path_dir = _offpolicy().resolve_checkpoint_path(tmp_path, "sac", "MyTask", "-1")
+    assert path is not None
+    assert "model_100.pt" in path
+
+
+def test_resolve_checkpoint_accepts_integer_latest_run(tmp_path):
+    """load_run=-1 from Hydra CLI picks the latest model."""
+    task_dir = tmp_path / "logs" / "sac" / "MyTask" / "run1"
+    task_dir.mkdir(parents=True)
+    (task_dir / "model_10.pt").write_bytes(b"")
+    (task_dir / "model_50.pt").write_bytes(b"")
+
+    path, path_dir = _offpolicy().resolve_checkpoint_path(tmp_path, "sac", "MyTask", -1)
+
+    assert path is not None
+    assert "model_50.pt" in path
+    assert path_dir == str(task_dir)
+
+
+def test_resolve_checkpoint_explicit_run_name(tmp_path):
+    """load_run = run-directory name under the log root."""
+    task_dir = tmp_path / "logs" / "sac" / "MyTask" / "myrun"
+    task_dir.mkdir(parents=True)
+    (task_dir / "model_5.pt").write_bytes(b"")
+
+    path, path_dir = _offpolicy().resolve_checkpoint_path(tmp_path, "sac", "MyTask", "myrun")
+    assert path is not None
+    assert "model_5.pt" in path
+    assert path_dir == str(task_dir)
+
+
+def test_resolve_checkpoint_nonexistent_explicit_path(tmp_path):
+    """load_run points to a path that doesn't exist → (None, None)."""
+    path, path_dir = _offpolicy().resolve_checkpoint_path(
+        tmp_path, "sac", "MyTask", "/nonexistent/model.pt"
+    )
+    assert path is None
+    assert path_dir is None
+
+
+def test_resolve_checkpoint_empty_run_dir(tmp_path):
+    """Run directory exists but has no model_*.pt → (None, None)."""
+    task_dir = tmp_path / "logs" / "sac" / "MyTask" / "run1"
+    task_dir.mkdir(parents=True)
+
+    path, path_dir = _offpolicy().resolve_checkpoint_path(tmp_path, "sac", "MyTask", "-1")
+    assert path is None
+
+
+def test_offpolicy_extract_reset_obs_handles_two_tuple():
+    from unilab.visualization.interactive_playback import extract_reset_obs
+
+    obs = {"obs": "value"}
+
+    result = extract_reset_obs((obs, {"info": 1}))
+
+    assert result is obs
+
+
+def test_offpolicy_extract_reset_obs_rejects_three_tuple():
+    from unilab.visualization.interactive_playback import extract_reset_obs
+
+    obs = {"obs": "value"}
+
+    with pytest.raises(ValueError, match="Unexpected env.reset return format"):
+        extract_reset_obs(("ignored", obs, {"info": 1}))
+
+
+def test_offpolicy_resolve_play_obs_dim_ignores_critic():
+    from unilab.visualization.interactive_playback import resolve_play_obs_dim
+
+    obs_dim = resolve_play_obs_dim({"obs": 98, "critic": 101})
+
+    assert obs_dim == 98
+
+
+def test_offpolicy_extract_play_obs_uses_obs_group_only():
+    import numpy as np
+
+    from unilab.visualization.interactive_playback import extract_play_obs
+
+    obs = {
+        "obs": np.ones((2, 98), dtype=np.float32),
+        "critic": np.full((2, 101), 2.0, dtype=np.float32),
+    }
+
+    play_obs = extract_play_obs(obs)
+
+    assert play_obs.shape == (2, 98)
+    assert np.allclose(play_obs, 1.0)
+
+
+def test_offpolicy_play_actor_spec_keeps_standard_sac_and_flashsac():
+    from unilab.visualization.interactive_playback import resolve_play_actor_spec
+
+    sac_cfg = _offpolicy_cfg(["task=g1_walk_flat/mujoco"])
+    flashsac_cfg = _offpolicy_cfg(["task=g1_walk_flat/mujoco"], algo="flashsac")
+
+    sac_algo_type, sac_kwargs = resolve_play_actor_spec(
+        "sac",
+        sac_cfg,
+        obs_dim=98,
+        critic_obs_dim=101,
+    )
+    flash_algo_type, flash_kwargs = resolve_play_actor_spec(
+        "flashsac",
+        flashsac_cfg,
+        obs_dim=98,
+        critic_obs_dim=101,
+    )
+
+    assert (sac_algo_type, sac_kwargs) == ("sac", {})
+    assert (flash_algo_type, flash_kwargs) == ("flashsac", {})
+
+
+def test_offpolicy_build_play_actor_preserves_flashsac_model_kwargs(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import uni_rl.algos.common.actor_factory as actor_factory
+    import uni_rl.algos.common.normalization as normalization
+
+    from unilab.visualization.interactive_playback import build_play_actor
+
+    captured: dict[str, Any] = {}
+
+    class FakeActor:
+        def eval(self):
+            captured["actor_eval"] = True
+
+    class FakeNormalizer:
+        def __init__(self, *args, **kwargs):
+            captured["normalizer_init"] = (args, kwargs)
+
+    def fake_build_actor(*args, **kwargs):
+        captured["actor_init"] = (args, kwargs)
+        return FakeActor()
+
+    monkeypatch.setattr(actor_factory, "build_actor", fake_build_actor)
+    monkeypatch.setattr(normalization, "EmpiricalNormalization", FakeNormalizer)
+    cfg = _offpolicy_cfg(["algo.obs_normalization=true"], algo="flashsac")
+
+    actor, normalizer, actor_algo_type, actor_kwargs = build_play_actor(
+        "flashsac",
+        cfg,
+        obs_dim=98,
+        critic_obs_dim=101,
+        action_dim=12,
+        device="cpu",
+    )
+
+    assert isinstance(actor, FakeActor)
+    assert isinstance(normalizer, FakeNormalizer)
+    assert (actor_algo_type, actor_kwargs) == ("flashsac", {})
+    args, kwargs = captured["actor_init"]
+    assert args == (
+        "flashsac",
+        98,
+        12,
+        cfg.algo.actor_hidden_dim,
+        cfg.algo.use_layer_norm,
+        "cpu",
+    )
+    assert kwargs == {
+        "actor_num_blocks": cfg.algo.algo_params.actor_num_blocks,
+        "actor_noise_zeta_mu": cfg.algo.algo_params.actor_noise_zeta_mu,
+        "actor_noise_zeta_max": cfg.algo.algo_params.actor_noise_zeta_max,
+    }
+    assert captured["normalizer_init"] == ((), {"shape": 98, "device": "cpu"})
+    assert captured["actor_eval"] is True
+
+
+@pytest.mark.parametrize("algo_name", ["sac", "flashsac"])
+def test_offpolicy_load_play_actor_keeps_sac_state_dict_strict(algo_name: str):
+    from unilab.visualization.interactive_playback import load_play_actor
+
+    captured: dict[str, Any] = {}
+
+    class FakeActor:
+        def load_state_dict(self, state_dict):
+            captured["state_dict"] = state_dict
+
+    actor_state = {"weight": object()}
+    load_play_actor(algo_name, FakeActor(), None, {"actor": actor_state})
+
+    assert captured["state_dict"] is actor_state
+
+
+def test_play_offpolicy_can_skip_onnx_export_and_still_record_video(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    import torch
+
+    mod = _offpolicy()
+    cfg = _offpolicy_cfg(
+        [
+            "task=g1_walk_flat/mujoco",
+            "training.play_only=true",
+            "training.play_render_mode=record",
+            "training.export_onnx=false",
+        ]
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    checkpoint = run_dir / "model_5000.pt"
+    torch.save({"actor": {}}, checkpoint)
+
+    captured: dict[str, Any] = {}
+
+    class FakeActor:
+        def eval(self):
+            return self
+
+        def load_state_dict(self, state_dict):
+            captured["loaded_state_dict"] = state_dict
+
+        def as_export_module(self):
+            raise AssertionError("ONNX export should be skipped when training.export_onnx=false")
+
+        def explore(self, obs, deterministic=True):
+            captured["deterministic"] = deterministic
+            return torch.zeros((obs.shape[0], 2), dtype=obs.dtype, device=obs.device)
+
+    class FakeEnv:
+        def __init__(self):
+            self.obs_groups_spec = {"obs": 4}
+            self.action_space = type("ActionSpace", (), {"shape": (2,)})()
+            self.state = None
+
+        def init_state(self):
+            self.state = type(
+                "State",
+                (),
+                {"obs": {"obs": np.zeros((cfg.training.play_env_num, 4), dtype=np.float32)}},
+            )()
+
+        def reset(self, env_ids):
+            batch = len(env_ids)
+            return ({"obs": np.zeros((batch, 4), dtype=np.float32)}, {})
+
+        def step(self, actions):
+            batch = actions.shape[0]
+            self.state = type(
+                "State",
+                (),
+                {
+                    "obs": {"obs": np.ones((batch, 4), dtype=np.float32)},
+                    "info": {},
+                },
+            )()
+            captured["actions_shape"] = actions.shape
+            return self.state
+
+        def run_playback_mode(self, **kwargs):
+            captured["play_render_mode"] = kwargs["play_render_mode"]
+            captured["output_video"] = kwargs["output_video"]
+            init_obs = kwargs["initialize"]()
+            captured["init_obs_shape"] = init_obs.shape
+            next_obs = kwargs["step"](init_obs)
+            captured["next_obs_shape"] = next_obs.shape
+            return str(kwargs["output_video"])
+
+    monkeypatch.setattr(mod, "build_offpolicy_env_cfg_override", lambda algo_name, cfg: {})
+    monkeypatch.setattr(mod, "default_device", lambda torch_module, preferred=None: "cpu")
+    monkeypatch.setattr(mod, "create_env", lambda *args, **kwargs: FakeEnv())
+    monkeypatch.setattr(
+        mod,
+        "resolve_checkpoint_path",
+        lambda *args, **kwargs: (str(checkpoint), str(run_dir)),
+    )
+
+    import unilab.utils.checkpoint as checkpoint_utils
+
+    monkeypatch.setattr(
+        checkpoint_utils,
+        "resolve_offpolicy_checkpoint_path",
+        lambda *args, **kwargs: (str(checkpoint), str(run_dir)),
+    )
+    monkeypatch.setattr(
+        torch.onnx,
+        "export",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("torch.onnx.export should not be called when training.export_onnx=false")
+        ),
+    )
+
+    import uni_rl.algos.common.actor_factory as actor_factory
+
+    monkeypatch.setattr(actor_factory, "build_actor", lambda *args, **kwargs: FakeActor())
+
+    result = mod.play_offpolicy("sac", cfg)
+    out = capsys.readouterr().out
+
+    assert result == str(run_dir / "play_video.mp4")
+    assert captured["loaded_state_dict"] == {}
+    assert captured["play_render_mode"] == "record"
+    assert captured["actions_shape"] == (cfg.training.play_env_num, 2)
+    assert captured["init_obs_shape"] == (cfg.training.play_env_num, 4)
+    assert captured["next_obs_shape"] == (cfg.training.play_env_num, 4)
+    assert captured["deterministic"] is True
+    assert "Skipping ONNX export because training.export_onnx=false." in out
+    assert not (run_dir / "policy.onnx").exists()
+
+
+# ---------------------------------------------------------------------------
+# play_interactive.py — resolve_checkpoint()
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _HAS_MUJOCO, reason="mujoco not installed")
+def test_play_resolve_checkpoint_nonexistent_run(tmp_path):
+    """Passing a non-existent explicit path returns None."""
+    mod = _load_script("play_interactive")
+    result = mod.resolve_checkpoint("MyTask", str(tmp_path / "no_run"))
+    assert result is None
+
+
+@pytest.mark.skipif(not _HAS_MUJOCO, reason="mujoco not installed")
+def test_play_resolve_checkpoint_dir_with_model(tmp_path):
+    """Directory path containing model_*.pt files resolves to the latest."""
+    mod = _load_script("play_interactive")
+    run_dir = tmp_path / "2024-01-01_mujoco"
+    run_dir.mkdir()
+    (run_dir / "model_10.pt").write_bytes(b"")
+    (run_dir / "model_50.pt").write_bytes(b"")
+
+    result = mod.resolve_checkpoint("MyTask", str(run_dir))
+    assert result is not None
+    assert "model_50.pt" in result
+
+
+@pytest.mark.skipif(not _HAS_MUJOCO, reason="mujoco not installed")
+def test_play_resolve_checkpoint_explicit_file(tmp_path):
+    """Absolute path to existing .pt file returns that path unchanged."""
+    mod = _load_script("play_interactive")
+    model_file = tmp_path / "model_99.pt"
+    model_file.write_bytes(b"")
+    result = mod.resolve_checkpoint("MyTask", str(model_file))
+    assert result == str(model_file)
+
+
+@pytest.mark.skipif(not _HAS_MUJOCO, reason="mujoco not installed")
+def test_play_resolve_checkpoint_empty_dir(tmp_path):
+    """Directory with no model_*.pt files returns None."""
+    mod = _load_script("play_interactive")
+    run_dir = tmp_path / "run1"
+    run_dir.mkdir()
+    result = mod.resolve_checkpoint("MyTask", str(run_dir))
+    assert result is None
+
+
+@pytest.mark.skipif(not _HAS_MUJOCO, reason="mujoco not installed")
+def test_play_resolve_checkpoint_delegates_to_shared_helper(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    mod = _load_script("play_interactive")
+    model_path = tmp_path / "resolved" / "model_12.pt"
+    model_path.parent.mkdir(parents=True)
+    model_path.write_bytes(b"")
+    captured: dict[str, object] = {}
+
+    def _fake_resolver(root_dir, **kwargs):
+        captured["root_dir"] = root_dir
+        captured.update(kwargs)
+        return model_path, model_path.parent
+
+    monkeypatch.setattr(mod, "resolve_task_checkpoint_path", _fake_resolver)
+
+    result = mod.resolve_checkpoint("MyTask", "-1", checkpoint="12", algo_log_name="custom_ppo")
+
+    assert result == str(model_path)
+    assert captured["root_dir"] == Path.cwd()
+    assert captured["task_name"] == "MyTask"
+    assert captured["load_run"] == "-1"
+    assert captured["algo_log_name"] == "custom_ppo"
+    assert captured["checkpoint"] == "12"
+
+
+# ---------------------------------------------------------------------------
+# RslRlVecEnvAdapter contract behavior (PPO path)
+# ---------------------------------------------------------------------------
+
+
+def _play_interactive():
+    """Load play_interactive.py as a module."""
+    return _load_script("play_interactive")
+
+
+def test_play_wrapper_imports_shared_implementation():
+    """PPO and APPO playback both use the UniLab-owned VecEnv adapter."""
+    mod = _play_interactive()
+    # uni_rl's RslRlVecEnvWrapper is no longer referenced: the PPO playback
+    # session defaults to the UniLab-owned adapter and the APPO branch passes
+    # it explicitly.
+    assert not hasattr(mod, "RslRlVecEnvWrapper")
+    source = Path(mod.__file__).read_text(encoding="utf-8")
+    assert "uni_rl.algos.rsl_rl" not in source
+    assert "wrapper_cls=RslRlVecEnvAdapter" in source
+
+
+def test_play_wrapper_uses_current_reset_contract():
+    """Verify wrapper reset() uses current (obs, info) contract, not old (_, obs, _)."""
+    import numpy as np
+    from tensordict import TensorDict
+
+    from unilab.rl import RslRlVecEnvAdapter
+
+    # Create a fake environment that returns (obs, info) tuple
+    class FakeEnv:
+        def __init__(self):
+            self.num_envs = 2
+            self.state = type("State", (), {"obs": {"obs": np.ones((2, 5), dtype=np.float32)}})()
+            self.cfg = type("Cfg", (), {"max_episode_seconds": 10.0, "ctrl_dt": 0.02})()
+            self.observation_space = type("Space", (), {"shape": (5,)})()
+            self.action_space = type("Space", (), {"shape": (3,)})()
+            self.obs_groups_spec = {"obs": 5}
+
+        def init_state(self):
+            pass
+
+        def reset(self, env_indices):
+            # Returns current contract: (obs, info)
+            return {"obs": np.ones((2, 5), dtype=np.float32)}, {}
+
+    env = FakeEnv()
+    wrapper = RslRlVecEnvAdapter(env, device="cpu", policy_obs_mode="flat")
+
+    # Reset should work with current contract
+    obs_td, info = wrapper.reset()
+
+    assert isinstance(obs_td, TensorDict)
+    assert "policy" in obs_td
+    assert "actor" in obs_td
+    assert obs_td.batch_size == (2,)
+
+
+def test_play_wrapper_policy_obs_mode_actor():
+    """Verify wrapper supports policy_obs_mode='actor'."""
+    import numpy as np
+
+    from unilab.rl import RslRlVecEnvAdapter
+
+    class FakeEnv:
+        def __init__(self):
+            self.num_envs = 1
+            self.state = type("State", (), {"obs": {"obs": np.ones((1, 3), dtype=np.float32)}})()
+            self.cfg = type("Cfg", (), {"max_episode_seconds": 10.0, "ctrl_dt": 0.02})()
+            self.observation_space = type("Space", (), {"shape": (3,)})()
+            self.action_space = type("Space", (), {"shape": (2,)})()
+            self.obs_groups_spec = {"obs": 3, "critic": 5}
+
+        def init_state(self):
+            pass
+
+        def reset(self, env_indices):
+            return {
+                "obs": np.ones((1, 3), dtype=np.float32),
+                "critic": np.zeros((1, 5), dtype=np.float32),
+            }, {}
+
+    env = FakeEnv()
+
+    # Test actor mode - num_obs should match actor obs dim only
+    wrapper_actor = RslRlVecEnvAdapter(env, device="cpu", policy_obs_mode="actor")
+    assert wrapper_actor.num_obs == 3  # Only "obs" group
+    assert wrapper_actor._actor_obs_dim == 3
+    assert wrapper_actor._flat_obs_dim == 3
+
+    obs_td, _ = wrapper_actor.reset()
+    # In actor mode, policy obs should equal actor obs
+    assert obs_td["policy"].shape == (1, 3)
+    assert obs_td["actor"].shape == (1, 3)
+    assert obs_td["critic"].shape == (1, 5)
+
+
+def test_play_wrapper_flat_policy_excludes_critic_only_group():
+    import numpy as np
+
+    from unilab.rl import RslRlVecEnvAdapter
+
+    class FakeEnv:
+        def __init__(self):
+            self.num_envs = 1
+            self.state = type(
+                "State",
+                (),
+                {
+                    "obs": {
+                        "obs": np.array([[1.0, 2.0, 3.0]], dtype=np.float32),
+                        "critic": np.array([[9.0, 9.0, 9.0, 9.0]], dtype=np.float32),
+                    }
+                },
+            )()
+            self.cfg = type("Cfg", (), {"max_episode_seconds": 10.0, "ctrl_dt": 0.02})()
+            self.observation_space = type("Space", (), {"shape": (7,)})()
+            self.action_space = type("Space", (), {"shape": (2,)})()
+            self.obs_groups_spec = {"obs": 3, "critic": 4}
+
+        def init_state(self):
+            pass
+
+        def reset(self, env_indices):
+            return cast(dict[str, np.ndarray], getattr(self.state, "obs")), {}
+
+    wrapper = RslRlVecEnvAdapter(FakeEnv(), device="cpu", policy_obs_mode="flat")
+    obs_td, _ = wrapper.reset()
+
+    np.testing.assert_allclose(
+        obs_td["policy"].cpu().numpy(),
+        np.array([[1.0, 2.0, 3.0]], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        obs_td["critic"].cpu().numpy(),
+        np.array([[9.0, 9.0, 9.0, 9.0]], dtype=np.float32),
+    )
+    assert wrapper.num_obs == 3
+    assert wrapper.num_privileged_obs == 4
+
+
+def test_play_wrapper_step_exports_time_outs_without_bootstrap_obs():
+    import torch
+
+    from unilab.rl import RslRlVecEnvAdapter
+
+    class FakeEnv:
+        def __init__(self):
+            self.num_envs = 1
+            self.cfg = type("Cfg", (), {"max_episode_seconds": 10.0, "ctrl_dt": 0.02})()
+            self.observation_space = type("Space", (), {"shape": (3,)})()
+            self.action_space = type("Space", (), {"shape": (2,)})()
+            self.obs_groups_spec = {"obs": 3, "critic": 2}
+            self.state = type("State", (), {"obs": {"obs": np.zeros((1, 3), dtype=np.float32)}})()
+
+        def init_state(self):
+            pass
+
+        def reset(self, env_indices):
+            return {"obs": np.zeros((1, 3), dtype=np.float32)}, {}
+
+        def step(self, actions):
+            return type(
+                "StepState",
+                (),
+                {
+                    "obs": {"obs": np.array([[1.0, 2.0, 3.0]], dtype=np.float32)},
+                    "reward": np.array([1.0], dtype=np.float32),
+                    "terminated": np.array([False]),
+                    "truncated": np.array([True]),
+                    "final_observation": {
+                        "obs": np.array([[7.0, 8.0, 9.0]], dtype=np.float32),
+                        "critic": np.array([[4.0, 5.0]], dtype=np.float32),
+                    },
+                    "info": {
+                        "final_observation": {
+                            "obs": np.array([[7.0, 8.0, 9.0]], dtype=np.float32),
+                            "critic": np.array([[4.0, 5.0]], dtype=np.float32),
+                        }
+                    },
+                },
+            )()
+
+    wrapper = RslRlVecEnvAdapter(FakeEnv(), device="cpu", policy_obs_mode="flat")
+
+    _, _, _, infos = wrapper.step(torch.zeros((1, 2)))
+
+    assert torch.equal(infos["time_outs"], torch.tensor([True]))
+    # The direct rsl-rl adapter no longer exports final observations.
+    assert "time_out_bootstrap_obs" not in infos
+
+
+# ---------------------------------------------------------------------------
+# Issue #168: Unified log directory and load_run resolution
+# ---------------------------------------------------------------------------
+
+
+def test_ppo_hydra_default_algo_log_name():
+    """Verify PPO config has algo_log_name in algo section."""
+    cfg = _ppo_cfg()
+    assert cfg.algo.algo_log_name == "rsl_rl_ppo"
+
+
+def test_ppo_hydra_load_run_in_algo_not_training():
+    """Verify load_run is in algo section, not training section (issue #168)."""
+    from omegaconf import OmegaConf
+
+    cfg = _ppo_cfg()
+    assert cfg.algo.load_run == "-1"
+    # training section should NOT have load_run anymore
+    assert "load_run" not in cfg.training or OmegaConf.is_missing(cfg.training, "load_run")
+
+
+def test_appo_hydra_default_algo_log_name():
+    """Verify APPO config has algo_log_name in algo section."""
+    cfg = _appo_cfg()
+    assert cfg.algo.algo_log_name == "appo"
+    assert cfg.algo.load_run == "-1"
+
+
+def test_offpolicy_sac_hydra_default_algo_log_name():
+    """Verify SAC config has algo_log_name in algo section."""
+    cfg = _offpolicy_cfg()
+    assert cfg.algo.algo_log_name == "fast_sac"
+    assert cfg.algo.load_run == "-1"
+
+
+def test_offpolicy_flashsac_hydra_algo_log_name():
+    cfg = _offpolicy_cfg(["task=g1_walk_flat/mujoco"], algo="flashsac")
+    assert cfg.algo.algo_log_name == "flash_sac"
+    assert cfg.algo.load_run == "-1"
+
+
+def test_offpolicy_flashsac_g1_walk_flat_task_composes() -> None:
+    cfg = _offpolicy_cfg(["task=g1_walk_flat/mujoco"], algo="flashsac")
+    assert cfg.training.task_name == "G1WalkFlat"
+    assert cfg.training.sim_backend == "mujoco"
+
+
+def test_offpolicy_flashsac_g1_motion_tracking_mjwarp_task_composes() -> None:
+    cfg = _offpolicy_cfg(["task=g1_motion_tracking/mjwarp"], algo="flashsac")
+    assert cfg.training.task_name == "G1MotionTrackingSAC"
+    assert cfg.training.sim_backend == "mjwarp"
+    assert cfg.training.play_render_mode == "record"
+
+
+@pytest.mark.parametrize("backend", ["mujoco", "motrix", "newton", "genesis"])
+def test_offpolicy_flashsac_g1_motion_tracking_task_composes(backend: str) -> None:
+    cfg = _offpolicy_cfg([f"task=g1_motion_tracking/{backend}"], algo="flashsac")
+    assert cfg.training.task_name == "G1MotionTrackingSAC"
+    assert cfg.training.sim_backend == backend
+    assert cfg.algo.num_envs == 2048
+    assert cfg.algo.max_iterations == 25000
+    if backend == "newton":
+        assert cfg.env.newton_use_cuda_graph is True
+
+
+def test_offpolicy_rejects_algo_argument_mismatch():
+    """build_runner must reject an algo argument inconsistent with cfg.algo.algo."""
+    cfg = _offpolicy_cfg(["task=g1_walk_flat/mujoco"])
+
+    with pytest.raises(ValueError, match="inconsistent with cfg.algo.algo"):
+        _offpolicy().build_runner("flashsac", cfg)
+
+
+def test_train_rsl_rl_get_log_root_uses_algo_log_name(monkeypatch: pytest.MonkeyPatch):
+    """Verify _get_log_root uses algo.algo_log_name (issue #168)."""
+    monkeypatch.delenv("UNILAB_TEST_LOG_ROOT", raising=False)
+    mod = _train_rsl_rl(monkeypatch)
+    cfg = _ppo_cfg()
+
+    # Override algo_log_name to test
+    cfg.algo.algo_log_name = "test_rsl_rl_ppo"
+
+    log_root = mod._get_log_root(cfg)
+    assert "logs/test_rsl_rl_ppo" in log_root.replace("\\", "/")
+
+
+def test_train_rsl_rl_play_missing_checkpoint_skips_env_creation_and_prints_context(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+):
+    monkeypatch.delenv("UNILAB_TEST_LOG_ROOT", raising=False)
+    mod = _train_rsl_rl(monkeypatch)
+    cfg = _ppo_cfg(["task=go2_joystick_flat/mujoco", "training.play_only=true"])
+    cfg.algo.algo_log_name = "custom_ppo"
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        mod,
+        "create_env",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("play_rsl_rl should not create an env before checkpoint resolution")
+        ),
+    )
+
+    result = mod.play_rsl_rl(cfg, device="cpu")
+
+    captured = capsys.readouterr().out
+    expected_task_log_root = tmp_path / "logs" / "custom_ppo" / cfg.training.task_name
+
+    assert result is None
+    assert "Could not resolve a checkpoint for play mode." in captured
+    assert "Task log root does not exist." in captured
+    assert f"task_log_root={expected_task_log_root}" in captured
+    assert "algo.load_run='-1'" in captured
+
+
+def test_train_rsl_rl_play_reports_missing_requested_checkpoint_in_resolved_run(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+):
+    monkeypatch.delenv("UNILAB_TEST_LOG_ROOT", raising=False)
+    mod = _train_rsl_rl(monkeypatch)
+    cfg = _ppo_cfg(["task=go2_joystick_flat/mujoco", "training.play_only=true"])
+    cfg.algo.algo_log_name = "custom_ppo"
+    cfg.algo.checkpoint = 12
+
+    run_dir = (
+        tmp_path / "logs" / "custom_ppo" / cfg.training.task_name / "2024-01-01_00-00-00_mujoco"
+    )
+    run_dir.mkdir(parents=True)
+    (run_dir / "model_9.pt").write_bytes(b"")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        mod,
+        "create_env",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("play_rsl_rl should not create an env before checkpoint resolution")
+        ),
+    )
+
+    result = mod.play_rsl_rl(cfg, device="cpu")
+
+    captured = capsys.readouterr().out
+
+    assert result is None
+    assert "Could not resolve a checkpoint for play mode." in captured
+    assert f"resolved_run={run_dir}" in captured
+    assert "algo.checkpoint=12" in captured
+
+
+def test_train_rsl_rl_motrix_auto_play_is_interactive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    mod = _train_rsl_rl(monkeypatch)
+    cfg = _ppo_cfg(
+        [
+            "task=go2_joystick_flat/motrix",
+            "training.play_only=true",
+            "training.play_steps=37",
+            "training.render_spacing=2.5",
+        ]
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    checkpoint = run_dir / "model_37.pt"
+    mod.torch.save({"actor_state_dict": {}}, checkpoint)
+
+    class FakeEnv:
+        def __init__(self):
+            self.cfg = type("Cfg", (), {"render_spacing": 2.5, "render_offset_mode": "zero"})()
+            self.obs_groups_spec = {"obs": 1}
+            self.action_space = type("Space", (), {"shape": (1,)})()
+
+        def run_playback_mode(self, **kwargs):
+            assert kwargs["play_render_mode"] == "auto"
+            assert kwargs["play_steps"] == 37
+            plan = type(
+                "Plan",
+                (),
+                {
+                    "mode": "interactive",
+                    "headless": False,
+                    "record_video": False,
+                    "num_steps": None,
+                    "output_video": None,
+                    "renderer": None,
+                },
+            )()
+            kwargs["on_plan"](plan)
+            captured["env"] = self
+            captured.update({key: value for key, value in kwargs.items() if key != "on_plan"})
+            captured["headless"] = plan.headless
+            captured["record_video"] = plan.record_video
+            captured["num_steps"] = plan.num_steps
+            captured["output_video"] = plan.output_video
+            return None
+
+    class FakeWrapper:
+        def __init__(self, env, device, policy_obs_mode="flat"):
+            self.env = env
+            self.device = device
+            self.policy_obs_mode = policy_obs_mode
+
+        def reset(self):
+            return 0, {}
+
+        def step(self, actions):
+            return 0, 0, False, {}
+
+    class FakeRunner:
+        def __init__(self, wrapped_env, train_cfg, log_dir, device):
+            self.wrapped_env = wrapped_env
+            self.train_cfg = train_cfg
+            self.log_dir = log_dir
+            self.device = device
+
+        def load(self, path, **kwargs):
+            self.loaded_path = path
+            self.load_kwargs = kwargs
+
+        def get_inference_policy(self, device):
+            return lambda obs: obs
+
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(mod, "EXPORT_POLICY", False, raising=False)
+    monkeypatch.setattr(mod, "parse_checkpoint_path", lambda *args, **kwargs: (checkpoint, run_dir))
+    monkeypatch.setattr(mod, "build_ppo_play_env_cfg_override", lambda cfg: {})
+    monkeypatch.setattr(mod, "create_env", lambda *args, **kwargs: FakeEnv())
+    create_session = mod.create_rsl_rl_playback_session
+    monkeypatch.setattr(
+        mod,
+        "create_rsl_rl_playback_session",
+        lambda *args, **kwargs: create_session(
+            *args, wrapper_cls=FakeWrapper, runner_cls=FakeRunner, **kwargs
+        ),
+    )
+
+    result = mod.play_rsl_rl(cfg, device="cpu")
+
+    assert result is None
+    assert captured["headless"] is False
+    assert captured["record_video"] is False
+    assert captured["num_steps"] is None
+    assert captured["output_video"] is None
+    assert captured["render_spacing"] == pytest.approx(2.5)
+    assert captured["render_offset_mode"] == "zero"
+
+
+def test_train_rsl_rl_record_play_uses_backend_plan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    mod = _train_rsl_rl(monkeypatch)
+    cfg = _ppo_cfg(
+        [
+            "task=go2_joystick_flat/motrix",
+            "training.play_only=true",
+            "training.play_render_mode=record",
+            "training.play_steps=37",
+        ]
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    checkpoint = run_dir / "model_37.pt"
+    mod.torch.save({"actor_state_dict": {}}, checkpoint)
+
+    class FakeEnv:
+        def __init__(self):
+            self.cfg = type("Cfg", (), {"render_spacing": 1.0, "render_offset_mode": "grid"})()
+            self.obs_groups_spec = {"obs": 1}
+            self.action_space = type("Space", (), {"shape": (1,)})()
+
+        def run_playback_mode(self, **kwargs):
+            assert kwargs["play_render_mode"] == "record"
+            assert kwargs["play_steps"] == 37
+            plan = type(
+                "Plan",
+                (),
+                {
+                    "mode": "record",
+                    "headless": True,
+                    "record_video": True,
+                    "num_steps": 37,
+                    "output_video": kwargs["output_video"],
+                    "renderer": None,
+                },
+            )()
+            kwargs["on_plan"](plan)
+            captured["env"] = self
+            captured.update({key: value for key, value in kwargs.items() if key != "on_plan"})
+            captured["headless"] = plan.headless
+            captured["record_video"] = plan.record_video
+            captured["num_steps"] = plan.num_steps
+            captured["output_video"] = plan.output_video
+            return str(plan.output_video)
+
+    class FakeWrapper:
+        def __init__(self, env, device, policy_obs_mode="flat"):
+            self.env = env
+            self.device = device
+            self.policy_obs_mode = policy_obs_mode
+
+        def reset(self):
+            return 0, {}
+
+        def step(self, actions):
+            return 0, 0, False, {}
+
+    class FakeRunner:
+        def __init__(self, wrapped_env, train_cfg, log_dir, device):
+            self.wrapped_env = wrapped_env
+            self.train_cfg = train_cfg
+            self.log_dir = log_dir
+            self.device = device
+
+        def load(self, path, **kwargs):
+            self.loaded_path = path
+            self.load_kwargs = kwargs
+
+        def get_inference_policy(self, device):
+            return lambda obs: obs
+
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(mod, "EXPORT_POLICY", False, raising=False)
+    monkeypatch.setattr(mod, "parse_checkpoint_path", lambda *args, **kwargs: (checkpoint, run_dir))
+    monkeypatch.setattr(mod, "build_ppo_play_env_cfg_override", lambda cfg: {})
+    monkeypatch.setattr(mod, "create_env", lambda *args, **kwargs: FakeEnv())
+    create_session = mod.create_rsl_rl_playback_session
+    monkeypatch.setattr(
+        mod,
+        "create_rsl_rl_playback_session",
+        lambda *args, **kwargs: create_session(
+            *args, wrapper_cls=FakeWrapper, runner_cls=FakeRunner, **kwargs
+        ),
+    )
+
+    result = mod.play_rsl_rl(cfg, device="cpu")
+
+    assert result == str(run_dir / "play_video.mp4")
+    assert captured["headless"] is True
+    assert captured["record_video"] is True
+    assert captured["num_steps"] == 37
+    assert captured["output_video"] == run_dir / "play_video.mp4"
+
+
+def test_train_appo_get_log_root_uses_algo_log_name(monkeypatch: pytest.MonkeyPatch):
+    """Verify APPO _get_log_root uses algo.algo_log_name (issue #168)."""
+    monkeypatch.delenv("UNILAB_TEST_LOG_ROOT", raising=False)
+    mod = _train_appo()
+    cfg = _appo_cfg()
+
+    cfg.algo.algo_log_name = "test_appo"
+
+    log_root = mod._get_log_root(cfg)
+    assert "logs/test_appo" in log_root.replace("\\", "/")
+
+
+def test_play_resolve_checkpoint_uses_algo_log_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Verify play_interactive.resolve_checkpoint uses algo_log_name (issue #168)."""
+    monkeypatch.delenv("UNILAB_TEST_LOG_ROOT", raising=False)
+    mod = _play_interactive()
+
+    # Create test directory structure with custom algo_log_name
+    run_dir = tmp_path / "logs" / "custom_ppo" / "MyTask" / "2024-01-01_mujoco"
+    run_dir.mkdir(parents=True)
+    (run_dir / "model_50.pt").write_bytes(b"")
+
+    # Run-artifact resolution now anchors at the caller's CWD.
+    monkeypatch.chdir(tmp_path)
+    result = mod.resolve_checkpoint("MyTask", "-1", algo_log_name="custom_ppo")
+    assert result is not None
+    assert "model_50.pt" in result
+
+
+def test_ppo_interactive_config_includes_playback_controls():
+    cfg = _ppo_cfg()
+
+    assert cfg.interactive.speed == pytest.approx(1.0)
+    assert cfg.interactive.start_paused is False
+
+
+def test_play_interactive_respects_training_device_override():
+    mod = _play_interactive()
+    cfg = OmegaConf.create({"training": {"device": "cpu"}})
+
+    assert mod._select_playback_device(cfg) == "cpu"
+
+
+def test_play_interactive_parses_explicit_cli():
+    mod = _play_interactive()
+
+    parsed = mod._parse_interactive_cli(
+        ["--algo", "ppo", "--task", "go2_joystick_flat", "--sim", "mujoco"]
+    )
+
+    assert parsed.algo == "ppo"
+    assert parsed.task == "go2_joystick_flat"
+    assert parsed.sim == "mujoco"
+    assert parsed.overrides == ["task=go2_joystick_flat/mujoco"]
+
+
+@pytest.mark.parametrize("algo", ["appo", "sac"])
+def test_play_interactive_parses_feature_algo_flags(algo: str):
+    mod = _play_interactive()
+
+    parsed = mod._parse_interactive_cli(
+        [f"--algo={algo}", "--task", "allegro_inhand", "--sim", "mujoco"]
+    )
+
+    assert parsed.algo == algo
+    assert parsed.overrides == ["task=allegro_inhand/mujoco"]
+
+
+def test_play_interactive_cli_respects_owner_action_mode_and_user_override():
+    mod = _play_interactive()
+
+    default_parsed = mod._parse_interactive_cli(
+        ["--algo", "ppo", "--task", "go2_joystick_flat", "--sim", "mujoco"]
+    )
+    default_cfg = mod._compose_interactive_config(default_parsed.algo, default_parsed.overrides)
+
+    assert default_cfg.interactive.action_mode == "zero"
+
+    parsed = mod._parse_interactive_cli(
+        [
+            "--algo",
+            "ppo",
+            "--task",
+            "go2_joystick_flat",
+            "--sim",
+            "mujoco",
+            "interactive.action_mode=random",
+        ]
+    )
+    cfg = mod._compose_interactive_config(parsed.algo, parsed.overrides)
+
+    assert parsed.overrides == [
+        "task=go2_joystick_flat/mujoco",
+        "interactive.action_mode=random",
+    ]
+    assert cfg.interactive.action_mode == "random"
+
+
+def test_play_interactive_rejects_unknown_algo_flag():
+    mod = _play_interactive()
+
+    with pytest.raises(SystemExit):
+        mod._parse_interactive_cli(
+            ["--algo=unknown", "--task", "go2_joystick_flat", "--sim", "mujoco"]
+        )
+
+
+def test_play_interactive_dynamic_compose_supports_algo_roots():
+    mod = _play_interactive()
+
+    ppo_cfg = mod._compose_interactive_config("ppo", ["task=go2_joystick_flat/mujoco"])
+    appo_cfg = mod._compose_interactive_config("appo", ["task=allegro_inhand/mujoco"])
+    sac_cfg = mod._compose_interactive_config("sac", ["task=g1_walk_flat/mujoco"])
+
+    assert ppo_cfg.algo.algo == "ppo"
+    assert appo_cfg.algo.algo == "appo"
+    assert sac_cfg.algo.algo == "sac"
+
+
+def test_play_interactive_sac_overrides_pass_through():
+    mod = _play_interactive()
+
+    overrides = mod._normalize_interactive_overrides(
+        "sac",
+        ["task=g1_walk_flat/mujoco", "algo.load_run=my_run"],
+    )
+
+    assert overrides == [
+        "task=g1_walk_flat/mujoco",
+        "algo.load_run=my_run",
+    ]
+
+
+def test_play_interactive_runner_log_dir_uses_algo_log_name(monkeypatch: pytest.MonkeyPatch):
+    import types
+
+    mod = _play_interactive()
+    captured: dict[str, object] = {}
+
+    class FakeWrapper:
+        def __init__(self, env, device, policy_obs_mode):
+            self.env = env
+            captured["policy_obs_mode"] = policy_obs_mode
+
+        def reset(self):
+            return None, {}
+
+    class FakeRunner:
+        def __init__(self, wrapped_env, train_cfg, log_dir, device):
+            del wrapped_env, train_cfg, device
+            captured["log_dir"] = log_dir
+
+        def load(self, ckpt, load_cfg):
+            captured["ckpt"] = ckpt
+            captured["load_cfg"] = load_cfg
+
+        def get_inference_policy(self, device):
+            del device
+            return object()
+
+    class FakeViewer:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def is_running(self):
+            return False
+
+        def sync(self):
+            pass
+
+        user_scn = type("Scene", (), {"ngeom": 0})()
+
+    fake_env = types.SimpleNamespace(
+        obs_groups_spec={"obs": 5},
+        action_space=types.SimpleNamespace(shape=(3,), low=np.full((3,), -1.0), high=np.ones((3,))),
+        cfg=types.SimpleNamespace(ctrl_dt=0.02),
+        get_playback_model=lambda: object(),
+        get_scene_visual_model_file=lambda: None,
+        get_physics_state_snapshot=lambda: np.zeros((1, 8), dtype=np.float32),
+    )
+
+    monkeypatch.setattr(mod.registry, "make", lambda *args, **kwargs: fake_env)
+    monkeypatch.setattr(mod, "resolve_checkpoint", lambda *args, **kwargs: "/tmp/model_10.pt")
+    monkeypatch.setattr(
+        mod,
+        "get_entrypoint_log_root",
+        lambda root_dir, *, algo_log_name, log_root=None: Path("/tmp") / algo_log_name,
+    )
+    create_session = mod.create_rsl_rl_playback_session
+    monkeypatch.setattr(
+        mod,
+        "create_rsl_rl_playback_session",
+        lambda *args, **kwargs: create_session(
+            *args, wrapper_cls=FakeWrapper, runner_cls=FakeRunner, **kwargs
+        ),
+    )
+    monkeypatch.setattr(mod, "PPOConfig", lambda: types.SimpleNamespace(to_dict=lambda: {}))
+    monkeypatch.setattr(mod.mujoco, "MjData", lambda model: object())
+    monkeypatch.setattr(mod.mujoco, "mj_setState", lambda *args, **kwargs: None)
+    monkeypatch.setattr(mod.mujoco, "mj_forward", lambda *args, **kwargs: None)
+    monkeypatch.setattr(mod.mujoco, "mjtState", types.SimpleNamespace(mjSTATE_FULLPHYSICS=0))
+    monkeypatch.setattr(mod.mujoco.viewer, "launch_passive", lambda *args, **kwargs: FakeViewer())
+
+    args = types.SimpleNamespace(
+        task="MyTask",
+        load_run="-1",
+        checkpoint=None,
+        action_mode="policy",
+        policy_obs_mode="flat",
+        algo_log_name="custom_ppo",
+        show_target_bodies=False,
+        show_reward_debug=False,
+        target_body_names="",
+        target_max_bodies=0,
+        target_marker_radius=0.02,
+        target_axis_length=0.08,
+        target_marker_alpha=0.75,
+        target_show_axes=False,
+        reward_debug_show_velocity=False,
+        reward_debug_lin_vel_scale=0.08,
+        reward_debug_ang_vel_scale=0.05,
+        reward_debug_show_connectors=False,
+        reward_debug_show_global_anchor=False,
+        speed=1.0,
+        start_paused=False,
+    )
+
+    mod.play_interactive(args)
+
+    assert captured["ckpt"] == "/tmp/model_10.pt"
+    assert captured["log_dir"].replace("\\", "/") == "/tmp/custom_ppo/MyTask/play_temp"
+
+
+def test_play_interactive_import_does_not_swallow_registry_bootstrap_errors(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import types
+
+    play_interactive_path = _PACKAGE_SCRIPTS_DIR / "play_interactive.py"
+    training_mod = cast(Any, types.ModuleType("unilab.training"))
+
+    def _fail_bootstrap() -> None:
+        raise RuntimeError("bootstrap failed")
+
+    training_mod.ensure_registries = _fail_bootstrap
+    training_mod.algo_config_dict = lambda cfg: {}
+    monkeypatch.setitem(sys.modules, "unilab.training", training_mod)
+
+    mujoco_mod = cast(Any, types.ModuleType("mujoco"))
+    mujoco_mod.viewer = cast(Any, types.ModuleType("mujoco.viewer"))
+    monkeypatch.setitem(sys.modules, "mujoco", mujoco_mod)
+    monkeypatch.setitem(sys.modules, "mujoco.viewer", mujoco_mod.viewer)
+
+    spec = importlib.util.spec_from_file_location(
+        "play_interactive_test_module", play_interactive_path
+    )
+    mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="bootstrap failed"):
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+
+
+# ---------------------------------------------------------------------------
+# Unified play entrypoints — shared playback session factories (issue #1242)
+# ---------------------------------------------------------------------------
+
+
+class _FakePlaybackEnv:
+    """Env stand-in driving one initialize/step cycle through run_playback_mode."""
+
+    def __init__(self, video_path: str):
+        self.cfg = types.SimpleNamespace(render_spacing=1.0, render_offset_mode="grid")
+        self.video_path = video_path
+        self.captured: dict[str, Any] = {}
+
+    def run_playback_mode(self, **kwargs: Any) -> str:
+        self.captured.update(kwargs)
+        self.captured["init_obs"] = kwargs["initialize"]()
+        self.captured["next_obs"] = kwargs["step"](self.captured["init_obs"])
+        return self.video_path
+
+
+def test_train_rsl_rl_play_uses_shared_playback_session_factory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    mod = _train_rsl_rl(monkeypatch)
+    cfg = _ppo_cfg(
+        [
+            "task=go2_joystick_flat/mujoco",
+            "training.play_only=true",
+            "training.play_render_mode=record",
+            "training.play_steps=5",
+        ]
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    checkpoint = run_dir / "model_37.pt"
+    mod.torch.save({"actor_state_dict": {}}, checkpoint)
+    captured: dict[str, Any] = {}
+
+    class FakeSession:
+        def __init__(self):
+            self.env = _FakePlaybackEnv(str(run_dir / "play_video.mp4"))
+            self.runner = object()
+            self.reset_calls = 0
+            self.step_calls = 0
+
+        def reset(self):
+            self.reset_calls += 1
+            return "obs_0"
+
+        def step_once(self):
+            self.step_calls += 1
+            return "obs_1"
+
+    fake_session = FakeSession()
+
+    def fake_create_session(**kwargs: Any):
+        captured["factory_kwargs"] = kwargs
+        return fake_session, "flat", str(checkpoint)
+
+    monkeypatch.setattr(mod, "EXPORT_POLICY", False, raising=False)
+    monkeypatch.setattr(mod, "parse_checkpoint_path", lambda *args, **kwargs: (checkpoint, run_dir))
+    monkeypatch.setattr(mod, "create_rsl_rl_playback_session", fake_create_session)
+
+    result = mod.play_rsl_rl(cfg, device="cpu")
+
+    assert result == str(run_dir / "play_video.mp4")
+    factory_kwargs = captured["factory_kwargs"]
+    playback_cfg = factory_kwargs["playback_cfg"]
+    assert playback_cfg.task == cfg.training.task_name
+    assert playback_cfg.action_mode == "policy"
+    assert playback_cfg.policy_obs_mode == "flat"
+    assert playback_cfg.algo_log_name == cfg.algo.algo_log_name
+    assert playback_cfg.num_envs == cfg.training.play_env_num
+    assert factory_kwargs["device"] == "cpu"
+    assert factory_kwargs["root_dir"] == Path.cwd()
+    # The session factory resolves the UniLab adapter and the upstream
+    # OnPolicyRunner itself; play_rsl_rl no longer forwards them.
+    assert "wrapper_cls" not in factory_kwargs
+    assert "runner_cls" not in factory_kwargs
+    assert "train_cfg_normalizer" not in factory_kwargs
+    assert factory_kwargs["guard_algo_name"] == "ppo"
+    assert factory_kwargs.get("runner_loader") is None
+    assert factory_kwargs["checkpoint_resolver"]() == str(checkpoint)
+    assert callable(factory_kwargs["sim2sim_preflight"])
+    assert fake_session.reset_calls == 1
+    assert fake_session.step_calls == 1
+    env_captured = fake_session.env.captured
+    assert env_captured["play_render_mode"] == "record"
+    assert env_captured["play_steps"] == 5
+    assert env_captured["init_obs"] == "obs_0"
+    assert env_captured["next_obs"] == "obs_1"
+
+
+def test_play_appo_missing_checkpoint_returns_none_without_env(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    mod = _train_appo()
+    cfg = _appo_cfg(["task=g1_walk_flat/mujoco", "training.play_only=true"])
+
+    monkeypatch.setattr(
+        mod,
+        "create_env",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("play_appo should not create an env before checkpoint resolution")
+        ),
+    )
+
+    result = mod.play_appo(cfg, {}, resolve_checkpoint_path=lambda _cfg: (None, None))
+
+    assert result is None
+    assert "Could not find run to load." in capsys.readouterr().out
+
+
+def test_play_appo_uses_shared_playback_session_factory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    import torch
+
+    mod = _train_appo()
+    cfg = _appo_cfg(
+        [
+            "task=g1_walk_flat/mujoco",
+            "training.play_only=true",
+            "training.play_render_mode=record",
+        ]
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    checkpoint = run_dir / "model_37.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    captured: dict[str, Any] = {}
+
+    class FakeActor:
+        def __init__(self):
+            self.mlp = torch.nn.Linear(4, 2)
+
+    class FakeSession:
+        def __init__(self):
+            self.env = _FakePlaybackEnv(str(run_dir / "play_video.mp4"))
+            self.actor = FakeActor()
+            self.wrapped_env = types.SimpleNamespace(num_obs=4)
+            self.reset_calls = 0
+            self.step_calls = 0
+
+        def reset(self):
+            self.reset_calls += 1
+            return "obs_0"
+
+        def step_once(self):
+            self.step_calls += 1
+            return "obs_1"
+
+    fake_session = FakeSession()
+    rl_cfg: dict[str, Any] = {"seed": 1}
+
+    def fake_create_session(**kwargs: Any):
+        captured["factory_kwargs"] = kwargs
+        return fake_session, "flat", str(checkpoint)
+
+    monkeypatch.setattr(mod, "create_appo_playback_session", fake_create_session)
+    monkeypatch.setattr(
+        mod, "export_policy_onnx", lambda *args, **kwargs: captured.setdefault("onnx_export", args)
+    )
+    monkeypatch.setattr(mod, "verify_policy_onnx", lambda *args, **kwargs: None)
+
+    result = mod.play_appo(
+        cfg,
+        rl_cfg,
+        resolve_checkpoint_path=lambda _cfg: (str(checkpoint), str(run_dir)),
+    )
+
+    assert result == str(run_dir / "play_video.mp4")
+    factory_kwargs = captured["factory_kwargs"]
+    playback_cfg = factory_kwargs["playback_cfg"]
+    assert playback_cfg.task == cfg.training.task_name
+    assert playback_cfg.action_mode == "policy"
+    assert playback_cfg.algo_log_name == cfg.algo.algo_log_name
+    assert playback_cfg.num_envs == cfg.training.play_env_num
+    assert factory_kwargs["cfg"] is cfg
+    assert factory_kwargs["rl_cfg"] is rl_cfg
+    assert factory_kwargs["root_dir"] == Path.cwd()
+    assert factory_kwargs["wrapper_cls"] is mod.RslRlVecEnvAdapter
+    assert "onnx_export" in captured
+    assert fake_session.reset_calls == 1
+    assert fake_session.step_calls == 1
+    env_captured = fake_session.env.captured
+    assert env_captured["play_render_mode"] == "record"
+    assert env_captured["init_obs"] == "obs_0"
+    assert env_captured["next_obs"] == "obs_1"
+
+
+def test_play_offpolicy_missing_checkpoint_returns_none_without_env(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    mod = _offpolicy()
+    cfg = _offpolicy_cfg(["task=g1_walk_flat/mujoco", "training.play_only=true"])
+
+    monkeypatch.setattr(mod, "resolve_checkpoint_path", lambda *args, **kwargs: (None, None))
+    monkeypatch.setattr(
+        mod,
+        "create_env",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("play_offpolicy should not create an env before checkpoint resolution")
+        ),
+    )
+
+    result = mod.play_offpolicy("sac", cfg)
+
+    assert result is None
+    assert "Could not find checkpoint." in capsys.readouterr().out
+
+
+def test_play_offpolicy_uses_shared_playback_session_factory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    mod = _offpolicy()
+    cfg = _offpolicy_cfg(
+        [
+            "task=g1_walk_flat/mujoco",
+            "training.play_only=true",
+            "training.play_render_mode=record",
+            "training.export_onnx=false",
+        ]
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    checkpoint = run_dir / "model_5000.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    captured: dict[str, Any] = {}
+
+    class FakeSession:
+        def __init__(self):
+            self.env = _FakePlaybackEnv(str(run_dir / "play_video.mp4"))
+            self.actor = object()
+            self.normalizer = None
+            self.actor_algo_type = "sac"
+            self.reset_calls = 0
+            self.step_calls = 0
+
+        def reset(self):
+            self.reset_calls += 1
+            return "obs_0"
+
+        def step_once(self):
+            self.step_calls += 1
+            return "obs_1"
+
+    fake_session = FakeSession()
+
+    def fake_create_session(**kwargs: Any):
+        captured["factory_kwargs"] = kwargs
+        return fake_session, "actor", str(checkpoint)
+
+    monkeypatch.setattr(mod, "default_device", lambda torch_module, preferred=None: "cpu")
+    monkeypatch.setattr(
+        mod,
+        "resolve_checkpoint_path",
+        lambda *args, **kwargs: (str(checkpoint), str(run_dir)),
+    )
+    monkeypatch.setattr(mod, "create_sac_playback_session", fake_create_session)
+
+    result = mod.play_offpolicy("sac", cfg)
+
+    assert result == str(run_dir / "play_video.mp4")
+    factory_kwargs = captured["factory_kwargs"]
+    playback_cfg = factory_kwargs["playback_cfg"]
+    assert playback_cfg.task == cfg.training.task_name
+    assert playback_cfg.action_mode == "policy"
+    assert playback_cfg.policy_obs_mode == "actor"
+    assert playback_cfg.algo_log_name == cfg.algo.algo_log_name
+    assert playback_cfg.num_envs == cfg.training.play_env_num
+    assert factory_kwargs["algo_name"] == "sac"
+    assert factory_kwargs["device"] == "cpu"
+    assert factory_kwargs["cfg"] is cfg
+    assert factory_kwargs["root_dir"] == Path.cwd()
+    assert callable(factory_kwargs["env_factory"])
+    assert fake_session.reset_calls == 1
+    assert fake_session.step_calls == 1
+    env_captured = fake_session.env.captured
+    assert env_captured["play_render_mode"] == "record"
+    assert env_captured["init_obs"] == "obs_0"
+    assert env_captured["next_obs"] == "obs_1"
+
+
+# ---------------------------------------------------------------------------
+# train_rsl_rl.py — EE-goal debug overlay getter (issue unilabsim/wuji_unilab#21)
+# ---------------------------------------------------------------------------
+
+
+class _OverlayEnv:
+    def __init__(self, goals, *, supports_debug_overlay=True):
+        from unilab.base.base import EnvPlayCapabilities
+
+        self.curr_ee_goal_world = goals
+        self.play_capabilities = EnvPlayCapabilities(supports_debug_overlay=supports_debug_overlay)
+
+
+def test_ee_goal_overlay_getter_builds_sphere_primitives(monkeypatch):
+    from unisim.backend.base import DebugPrimitive
+
+    mod = _train_rsl_rl(monkeypatch)
+    goals = np.array([[0.1, 0.2, 0.3], [np.nan, 0.0, 0.0]], dtype=np.float64)
+    getter = mod._ee_goal_debug_overlay_getter(_OverlayEnv(goals))
+    assert getter is not None
+    overlays = getter()
+    assert len(overlays) == 2
+    primitive = overlays[0][0]
+    assert isinstance(primitive, DebugPrimitive)
+    assert primitive.kind == "sphere"
+    assert primitive.pos == pytest.approx((0.1, 0.2, 0.3))
+    assert overlays[1] is None  # non-finite goals suppress that env's overlay
+
+
+def test_ee_goal_overlay_getter_disabled_without_marker_or_capability(monkeypatch):
+    mod = _train_rsl_rl(monkeypatch)
+    assert mod._ee_goal_debug_overlay_getter(object()) is None
+    env = _OverlayEnv(np.zeros((1, 3)), supports_debug_overlay=False)
+    assert mod._ee_goal_debug_overlay_getter(env) is None
+
+
+class _DiscoverableOverlayEnv(_OverlayEnv):
+    def __init__(self, goals, *, task_overlays="task", **kwargs):
+        super().__init__(goals, **kwargs)
+        self._task_overlays = task_overlays
+
+    def get_playback_debug_overlays(self):
+        if self._task_overlays is None:
+            return None
+        return lambda: self._task_overlays
+
+
+def test_playback_debug_overlay_getter_prefers_task_owned_overlays(monkeypatch):
+    mod = _train_rsl_rl(monkeypatch)
+    env = _DiscoverableOverlayEnv(np.zeros((1, 3)), task_overlays="task")
+
+    getter = mod._playback_debug_overlay_getter(env)
+
+    assert getter is not None
+    assert getter() == "task"
+
+
+def test_playback_debug_overlay_getter_falls_back_to_ee_goal_marker(monkeypatch):
+    from unisim.backend.base import DebugPrimitive
+
+    mod = _train_rsl_rl(monkeypatch)
+    goals = np.array([[0.1, 0.2, 0.3]], dtype=np.float64)
+    env = _DiscoverableOverlayEnv(goals, task_overlays=None)
+
+    getter = mod._playback_debug_overlay_getter(env)
+
+    assert getter is not None
+    overlays = getter()
+    assert isinstance(overlays[0][0], DebugPrimitive)
+    assert overlays[0][0].pos == pytest.approx((0.1, 0.2, 0.3))
+
+
+def test_playback_debug_overlay_getter_falls_back_without_discovery_hook(monkeypatch):
+    mod = _train_rsl_rl(monkeypatch)
+    env = _OverlayEnv(np.array([[0.1, 0.2, 0.3]], dtype=np.float64))
+
+    getter = mod._playback_debug_overlay_getter(env)
+
+    assert getter is not None
+    assert getter()[0][0].pos == pytest.approx((0.1, 0.2, 0.3))
+
+
+def test_playback_debug_overlay_getter_disabled_without_capability(monkeypatch):
+    mod = _train_rsl_rl(monkeypatch)
+    env = _DiscoverableOverlayEnv(
+        np.zeros((1, 3)), task_overlays="task", supports_debug_overlay=False
+    )
+
+    assert mod._playback_debug_overlay_getter(env) is None

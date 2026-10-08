@@ -1,0 +1,369 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from unilab.cli_completion import (
+    COMPLETION_BLOCK_END,
+    COMPLETION_BLOCK_START,
+    build_metadata,
+    complete_words,
+    install_main,
+)
+
+
+def _write_completion_fixture(root: Path) -> None:
+    (root / "pyproject.toml").write_text(
+        "\n".join(
+            [
+                "[project.scripts]",
+                'train = "unilab.cli:train_main"',
+                'eval = "unilab.cli:eval_main"',
+                'demo = "unilab.cli:demo_main"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (root / "scripts" / "benchmark" / "core").mkdir(parents=True)
+    (root / "scripts" / "benchmark" / "benchmark_sim.py").write_text("", encoding="utf-8")
+    (root / "scripts" / "benchmark" / "core" / "runner.py").write_text("", encoding="utf-8")
+    (root / "scripts" / "play_viser.py").write_text("", encoding="utf-8")
+    owner_files = {
+        root / "conf" / "ppo" / "task" / "go1" / "mujoco.yaml": """
+training:
+  task_name: Go1
+  sim_backend: mujoco
+""",
+        root / "conf" / "ppo" / "task" / "go1" / "mujoco_nodr.yaml": """
+defaults:
+  - /task/go1/mujoco
+  - _self_
+algo:
+  algo_log_name: nodr_ppo
+""",
+        root / "conf" / "ppo" / "task" / "go1" / "motrix_lab.yaml": """
+training:
+  task_name: Go1
+  sim_backend: motrix
+""",
+        root / "conf" / "ppo" / "task" / "go2" / "mujoco_lab.yaml": """
+training:
+  task_name: Go2
+  sim_backend: mujoco
+""",
+        root / "conf" / "ppo" / "task" / "go3" / "mujoco_custom.yaml": """
+training:
+  task_name: Go3
+  sim_backend: mujoco
+  log_root: custom_logs
+""",
+        root / "conf" / "sac" / "task" / "go4" / "mujoco.yaml": """
+training:
+  task_name: Go4
+  sim_backend: mujoco
+""",
+    }
+    for path, content in owner_files.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content.strip() + "\n", encoding="utf-8")
+
+    for path in [
+        root / "logs" / "rsl_rl_ppo" / "Go1" / "2026-01-01_00-00-00_mujoco",
+        root / "logs" / "rsl_rl_ppo" / "Go1" / "2026-01-02_00-00-00_mujoco",
+        root / "logs" / "rsl_rl_ppo" / "Go2" / "2026-02-01_00-00-00_mujoco",
+        root / "logs" / "nodr_ppo" / "Go1" / "2026-03-01_00-00-00_mujoco",
+        root / "custom_logs" / "Go3" / "2026-04-01_00-00-00_mujoco",
+    ]:
+        path.mkdir(parents=True)
+
+
+def test_uv_run_command_position_includes_project_scripts_and_run_paths(tmp_path: Path) -> None:
+    _write_completion_fixture(tmp_path)
+    metadata = build_metadata(tmp_path)
+
+    assert "demo" in complete_words(["uv", "run", "d"], 2, metadata)
+    assert complete_words(["uv", "run", "s"], 2, metadata) == ["scripts/"]
+
+
+def test_uv_run_path_completion_is_hierarchical(tmp_path: Path) -> None:
+    _write_completion_fixture(tmp_path)
+    metadata = build_metadata(tmp_path)
+
+    benchmark_choices = complete_words(["uv", "run", "scripts/benchmark/"], 2, metadata)
+    assert "scripts/benchmark/benchmark_sim.py" in benchmark_choices
+    assert "scripts/benchmark/core/" in benchmark_choices
+    assert "scripts/benchmark/core/runner.py" not in benchmark_choices
+
+    assert complete_words(["uv", "run", "scripts/benchmark/core/"], 2, metadata) == [
+        "scripts/benchmark/core/runner.py"
+    ]
+
+
+def test_uv_run_unknown_command_arguments_defer_to_shell_completion(tmp_path: Path) -> None:
+    _write_completion_fixture(tmp_path)
+    metadata = build_metadata(tmp_path)
+
+    assert (
+        complete_words(["uv", "run", "scripts/benchmark/benchmark_sim.py", ""], 3, metadata) == []
+    )
+
+
+def test_eval_load_run_value_position_completes_latest_run_alias(tmp_path: Path) -> None:
+    _write_completion_fixture(tmp_path)
+    metadata = build_metadata(tmp_path)
+
+    choices = complete_words(["uv", "run", "eval", "--load-run", ""], 4, metadata)
+    assert choices == ["-1"]
+    assert "--algo" not in choices
+    assert complete_words(["uv", "run", "eval", "--load-run", "-"], 4, metadata) == ["-1"]
+    assert complete_words(["uv", "run", "eval", "--load-run", "run"], 4, metadata) == []
+
+
+def test_eval_load_run_value_position_completes_task_run_dirs(tmp_path: Path) -> None:
+    _write_completion_fixture(tmp_path)
+    metadata = build_metadata(tmp_path)
+
+    assert complete_words(
+        [
+            "uv",
+            "run",
+            "eval",
+            "--algo",
+            "ppo",
+            "--task",
+            "go1",
+            "--sim",
+            "mujoco",
+            "--load-run",
+            "",
+        ],
+        10,
+        metadata,
+    ) == ["-1", "2026-01-01_00-00-00_mujoco", "2026-01-02_00-00-00_mujoco"]
+    assert complete_words(
+        [
+            "uv",
+            "run",
+            "eval",
+            "--algo",
+            "ppo",
+            "--task",
+            "go1",
+            "--sim",
+            "mujoco",
+            "--load-run",
+            "2026-01-02",
+        ],
+        10,
+        metadata,
+    ) == ["2026-01-02_00-00-00_mujoco"]
+
+
+def test_eval_load_run_completion_respects_profile_log_name(tmp_path: Path) -> None:
+    _write_completion_fixture(tmp_path)
+    metadata = build_metadata(tmp_path)
+
+    assert complete_words(
+        [
+            "uv",
+            "run",
+            "eval",
+            "--algo",
+            "ppo",
+            "--task",
+            "go1",
+            "--sim",
+            "mujoco",
+            "--profile",
+            "nodr",
+            "--load-run",
+            "",
+        ],
+        12,
+        metadata,
+    ) == ["-1", "2026-03-01_00-00-00_mujoco"]
+
+
+def test_eval_load_run_completion_respects_training_log_root(tmp_path: Path) -> None:
+    _write_completion_fixture(tmp_path)
+    metadata = build_metadata(tmp_path)
+
+    assert complete_words(
+        [
+            "uv",
+            "run",
+            "eval",
+            "--algo",
+            "ppo",
+            "--task",
+            "go3",
+            "--sim",
+            "mujoco",
+            "--profile",
+            "custom",
+            "--load-run",
+            "",
+        ],
+        12,
+        metadata,
+    ) == ["-1", "2026-04-01_00-00-00_mujoco"]
+
+
+def test_train_profile_value_position_completes_profile_names(tmp_path: Path) -> None:
+    _write_completion_fixture(tmp_path)
+    metadata = build_metadata(tmp_path)
+
+    assert complete_words(
+        ["uv", "run", "train", "--algo", "ppo", "--sim", "mujoco", "--profile", ""],
+        8,
+        metadata,
+    ) == ["custom", "lab", "nodr"]
+    choices = complete_words(
+        ["uv", "run", "train", "--algo", "ppo", "--sim", "mujoco", "--profile", "n"],
+        8,
+        metadata,
+    )
+    assert choices == ["nodr"]
+    assert "--algo" not in choices
+    assert complete_words(
+        [
+            "uv",
+            "run",
+            "train",
+            "--algo",
+            "ppo",
+            "--task",
+            "go1",
+            "--sim",
+            "mujoco",
+            "--profile",
+            "",
+        ],
+        10,
+        metadata,
+    ) == ["nodr"]
+    assert complete_words(
+        [
+            "uv",
+            "run",
+            "train",
+            "--algo",
+            "ppo",
+            "--task",
+            "go1",
+            "--sim",
+            "motrix",
+            "--profile",
+            "",
+        ],
+        10,
+        metadata,
+    ) == ["lab"]
+    assert complete_words(
+        ["uv", "run", "eval", "--algo", "ppo", "--sim", "mujoco", "--profile", "n"],
+        8,
+        metadata,
+    ) == ["nodr"]
+
+
+def test_task_completion_respects_selected_profile(tmp_path: Path) -> None:
+    _write_completion_fixture(tmp_path)
+    metadata = build_metadata(tmp_path)
+
+    assert complete_words(
+        [
+            "uv",
+            "run",
+            "train",
+            "--algo",
+            "ppo",
+            "--sim",
+            "mujoco",
+            "--profile",
+            "nodr",
+            "--task",
+            "",
+        ],
+        10,
+        metadata,
+    ) == ["go1"]
+
+
+def test_task_completion_covers_per_algo_offpolicy_trees(tmp_path: Path) -> None:
+    _write_completion_fixture(tmp_path)
+    metadata = build_metadata(tmp_path)
+
+    assert complete_words(
+        ["uv", "run", "train", "--algo", "sac", "--sim", "mujoco", "--task", ""],
+        8,
+        metadata,
+    ) == ["go4"]
+
+
+def test_demo_positional_completes_all_demo_names(tmp_path: Path) -> None:
+    _write_completion_fixture(tmp_path)
+    metadata = build_metadata(tmp_path)
+
+    choices = complete_words(["uv", "run", "demo", ""], 3, metadata)
+    assert choices == [
+        "boxtracking",
+        "dance",
+        "teaser",
+    ]
+
+
+def test_demo_positional_filters_by_prefix(tmp_path: Path) -> None:
+    _write_completion_fixture(tmp_path)
+    metadata = build_metadata(tmp_path)
+
+    assert complete_words(["uv", "run", "demo", "d"], 3, metadata) == ["dance"]
+    assert complete_words(["uv", "run", "demo", "t"], 3, metadata) == ["teaser"]
+
+
+def test_demo_flags_completed_after_demo_name(tmp_path: Path) -> None:
+    _write_completion_fixture(tmp_path)
+    metadata = build_metadata(tmp_path)
+
+    choices = complete_words(["uv", "run", "demo", "dance", "--"], 4, metadata)
+    assert choices == ["--device", "--refresh"]
+
+
+def test_demo_used_flag_excluded_from_completions(tmp_path: Path) -> None:
+    _write_completion_fixture(tmp_path)
+    metadata = build_metadata(tmp_path)
+
+    choices = complete_words(["uv", "run", "demo", "dance", "--refresh", "--"], 5, metadata)
+    assert choices == ["--device"]
+
+
+def test_demo_device_value_position_defers_to_shell(tmp_path: Path) -> None:
+    _write_completion_fixture(tmp_path)
+    metadata = build_metadata(tmp_path)
+
+    assert complete_words(["uv", "run", "demo", "dance", "--device", ""], 5, metadata) == []
+
+
+def test_demo_name_still_completes_when_leading_flag_present(tmp_path: Path) -> None:
+    _write_completion_fixture(tmp_path)
+    metadata = build_metadata(tmp_path)
+
+    assert complete_words(["uv", "run", "demo", "--refresh", "d"], 4, metadata) == [
+        "dance",
+    ]
+
+
+def test_completion_install_preserves_non_utf8_rc_file_bytes(tmp_path: Path) -> None:
+    rc_file = tmp_path / ".bashrc"
+    original = b"export OK=1\n# non utf8: \x9c\n"
+    rc_file.write_bytes(original)
+
+    assert install_main(["--shell", "bash", "--rc-file", str(rc_file)]) == 0
+
+    installed = rc_file.read_bytes()
+    assert b"\x9c" in installed
+    assert COMPLETION_BLOCK_START.encode("utf-8") in installed
+    assert COMPLETION_BLOCK_END.encode("utf-8") in installed
+
+    assert install_main(["--shell", "bash", "--rc-file", str(rc_file), "--uninstall"]) == 0
+
+    uninstalled = rc_file.read_bytes()
+    assert uninstalled == original

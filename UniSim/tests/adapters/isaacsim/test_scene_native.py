@@ -1,0 +1,835 @@
+"""Opt-in real-worker acceptance; this is not public host integration coverage.
+
+Run with UNISIM_TEST_ISAACSIM_SCENE=1 after provisioning the dedicated SDK.
+Three N=5 scenes run sequentially; no SDK installation occurs in this test.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import time
+from dataclasses import replace
+from multiprocessing import shared_memory
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from unisim.backend.isaacsim.dependencies import build_worker_env, resolve_isaacsim_runtime
+from unisim.backend.subprocess_ipc import protocol
+from unisim.backend.subprocess_ipc.backend import _read_exactly_with_deadline
+from unisim.scene_layout import CompiledSceneLayout, EntityLayout, GeomLayout, JointLayout
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get("UNISIM_TEST_ISAACSIM_SCENE") != "1",
+    reason="set UNISIM_TEST_ISAACSIM_SCENE=1 for real IsaacSim scene acceptance",
+)
+
+_ROBOT = """<mujoco><worldbody><body name="base">
+<inertial pos="0 0 0" mass="1" diaginertia=".01 .01 .01"/>
+<geom name="base_geom" type="sphere" size=".1" friction=".8 .2 .03"/>
+<geom name="base_pad" type="box" size=".06 .06 .02" pos="0 0 .1" friction=".4 .1 .02"/>
+<body name="tip" pos="0 0 .3">
+<joint name="hinge" type="hinge" range="-90 90"/>
+<inertial pos="0 0 .1" mass=".5" diaginertia=".005 .005 .005"/>
+<geom type="capsule" size=".04 .1"/></body></body></worldbody>
+<actuator><position name="motor" joint="hinge" kp="10" kv="1"
+forcerange="-100 100"/></actuator></mujoco>"""
+_PASSIVE = """<mujoco><worldbody><body name="anchor">
+<inertial pos="0 0 0" mass="1" diaginertia=".01 .01 .01"/>
+<geom type="sphere" size=".03"/><body name="pendulum" pos=".15 0 0">
+<joint name="passive" type="hinge" axis="0 1 0" range="-170 170"/>
+<inertial pos=".1 0 0" mass=".2" diaginertia=".001 .002 .003"/>
+<geom type="sphere" size=".03" pos=".1 0 0"/></body></body></worldbody></mujoco>"""
+_NUM_ENVS = 5
+_OBJECT_ASSIGNMENT = [1, 1, 0, 1, 0]
+
+
+def _record(mujoco, source, entity):
+    model = mujoco.MjModel.from_xml_path(source)
+    bodies = [model.body(name).id for name in entity.body_names]
+    joints = [model.joint(joint.name).id for joint in entity.joints]
+    count = len(joints)
+    stiffness = [0.0] * count
+    damping = [0.0] * count
+    effort = [0.0] * count
+    for actuator in range(model.nu):
+        if model.actuator(actuator).name not in entity.actuator_names:
+            continue
+        position = joints.index(int(model.actuator_trnid[actuator, 0]))
+        stiffness[position] = float(model.actuator_gainprm[actuator, 0])
+        damping[position] = -float(model.actuator_biasprm[actuator, 2])
+        effort[position] = (
+            float(model.actuator_forcerange[actuator, 1])
+            if model.actuator_forcelimited[actuator]
+            else 1e9
+        )
+    sphere_radii = []
+    geom_names, geom_body_names = [], []
+    geom_contype, geom_conaffinity, geom_friction = [], [], []
+    for body in entity.body_names:
+        body_id = model.body(body).id
+        sphere_radii.append(
+            [
+                float(model.geom_size[geom, 0])
+                for geom in range(model.ngeom)
+                if model.geom_bodyid[geom] == body_id
+                and model.geom_type[geom] == mujoco.mjtGeom.mjGEOM_SPHERE
+            ]
+        )
+        body_offset = 0
+        for geom in range(model.ngeom):
+            if model.geom_bodyid[geom] != body_id:
+                continue
+            source_name = model.geom(geom).name
+            geom_names.append(
+                source_name if source_name else f"{body}::geom{body_offset}"
+            )
+            geom_body_names.append(body)
+            geom_contype.append(int(model.geom_contype[geom]))
+            geom_conaffinity.append(int(model.geom_conaffinity[geom]))
+            geom_friction.append(model.geom_friction[geom].tolist())
+            body_offset += 1
+    assert geom_names == [geom.name for geom in entity.geoms]
+    assert geom_body_names == [geom.body_name for geom in entity.geoms]
+    return {
+        "joint_names": [joint.name for joint in entity.joints],
+        "actuator_names": list(entity.actuator_names),
+        "actuator_joint_names": list(entity.actuator_joint_names),
+        "dof_stiffness": stiffness,
+        "dof_damping": damping,
+        "dof_effort": effort,
+        "dof_armature": [0.0] * count,
+        "dof_friction": [0.0] * count,
+        "dof_lower": model.jnt_range[joints, 0].tolist(),
+        "dof_upper": model.jnt_range[joints, 1].tolist(),
+        "body_names": list(entity.body_names),
+        "body_mass": model.body_mass[bodies].tolist(),
+        "body_ipos": model.body_ipos[bodies].tolist(),
+        "body_inertia": model.body_inertia[bodies].tolist(),
+        "body_iquat": model.body_iquat[bodies].tolist(),
+        "body_sphere_radii": sphere_radii,
+        "geom_names": geom_names,
+        "geom_body_names": geom_body_names,
+        "geom_contype": geom_contype,
+        "geom_conaffinity": geom_conaffinity,
+        "geom_friction": geom_friction,
+    }
+
+
+def _geoms(mujoco, source, entity):
+    model = mujoco.MjModel.from_xml_path(source)
+    result = []
+    for body_name in entity.body_names:
+        body_id = model.body(body_name).id
+        offset = 0
+        for geom in range(model.ngeom):
+            if model.geom_bodyid[geom] != body_id:
+                continue
+            source_name = model.geom(geom).name
+            result.append(
+                GeomLayout(
+                    source_name if source_name else f"{body_name}::geom{offset}",
+                    body_name,
+                )
+            )
+            offset += 1
+    return tuple(result)
+
+
+def _scene(directory: Path, mode: str):
+    # Independent source oracle; never use the native importer's own metadata
+    # as the expected mass/inertia/topology of the imported asset.
+    mujoco = pytest.importorskip("mujoco")
+
+    def write(name, text):
+        path = directory / (name + ".xml")
+        path.write_text(text, encoding="utf-8")
+        return str(path)
+
+    floating_robot = mode == "floating"
+    floating_passive = mode == "passive_float"
+    robot_xml = (
+        _ROBOT.replace('<body name="base">', '<body name="base"><freejoint/>')
+        if floating_robot
+        else _ROBOT
+    )
+    sources = [[write("robot", robot_xml)]]
+    objects = [
+        write(
+            f"object{index}",
+            f"""<mujoco><worldbody><body name="box"><freejoint/>
+    <inertial pos=".02 0 0" mass="{mass}" diaginertia=".01 .02 .03"/>
+    <geom type="box" size=".08 .08 .08" friction="{0.9 - index * 0.5} .2 .03"/>
+    </body></worldbody></mujoco>""",
+        )
+        for index, mass in enumerate((1, 2))
+    ]
+    sources.extend(
+        [
+            objects,
+            [
+                write(
+                    "table",
+                    """<mujoco><worldbody><body name="table">
+    <inertial pos="0 0 0" mass="5" diaginertia="1 1 1"/>
+    <geom type="box" size=".5 .5 .05"/></body></worldbody></mujoco>""",
+                )
+            ],
+            objects,
+        ]
+    )
+    entities = [
+        EntityLayout(
+            "robot",
+            "articulation",
+            "floating" if floating_robot else "fixed",
+            "base",
+            ("base", "tip"),
+            (0, 1),
+            (None, "base"),
+            (JointLayout("hinge", "hinge", (0,), (0,), "tip"),),
+            ("motor",),
+            ("hinge",),
+            (0,),
+            tuple(range(8, 15)) if floating_robot else (),
+            tuple(range(7, 13)) if floating_robot else (),
+        ),
+        EntityLayout(
+            "object",
+            "rigid",
+            "floating",
+            "box",
+            ("box",),
+            (2,),
+            (None,),
+            (),
+            (),
+            (),
+            (),
+            tuple(range(1, 8)),
+            tuple(range(1, 7)),
+        ),
+        EntityLayout("table", "rigid", "fixed", "table", ("table",), (3,), (None,), (), (), (), ()),
+        EntityLayout(
+            "mirror", "rigid", "kinematic", "box", ("box",), (4,), (None,), (), (), (), ()
+        ),
+    ]
+    poses = [
+        [0, 0, 0.5, 1, 0, 0, 0],
+        [0.3, 0, 1, 1, 0, 0, 0],
+        [0.3, 0, 0.3, 1, 0, 0, 0],
+        [-0.4, 0, 1, 1, 0, 0, 0],
+    ]
+    if not floating_robot:
+        passive_xml = (
+            _PASSIVE.replace('<body name="anchor">', '<body name="anchor"><freejoint/>')
+            if floating_passive
+            else _PASSIVE
+        )
+        sources.append([write("passive", passive_xml)])
+        poses.append([0.7, 0.2, 0.8, 1, 0, 0, 0])
+        entities.append(
+            EntityLayout(
+                "passive",
+                "articulation",
+                "floating" if floating_passive else "fixed",
+                "anchor",
+                ("anchor", "pendulum"),
+                (5, 6),
+                (None, "anchor"),
+                (JointLayout("passive", "hinge", (8,), (7,), "pendulum"),),
+                (),
+                (),
+                (),
+                tuple(range(9, 16)) if floating_passive else (),
+                tuple(range(8, 14)) if floating_passive else (),
+            )
+        )
+    entities = [
+        replace(entity, geoms=_geoms(mujoco, sources[index][0], entity))
+        for index, entity in enumerate(entities)
+    ]
+    layout = CompiledSceneLayout(
+        tuple(entities),
+        15 if floating_robot else 16 if floating_passive else 9,
+        13 if floating_robot else 14 if floating_passive else 8,
+        1,
+        5 if floating_robot else 7,
+        8 if not floating_robot else 6,
+    )
+    entries = [
+        {
+            "name": entity.name,
+            "kind": entity.kind,
+            "root_mode": entity.root_mode,
+            "asset_format": "mjcf",
+            "collision_enabled": entity.name != "mirror",
+            "mirror_of": "object" if entity.name == "mirror" else None,
+            "self_collision": False,
+            # Worker payloads carry the host-resolved bool; these match the
+            # implicit IsaacSim role default (kinematic and fixed rigid).
+            "gravity_disabled": entity.root_mode == "kinematic"
+            or (entity.kind == "rigid" and entity.root_mode == "fixed"),
+            "initial_pose": poses[index],
+            "sources": sources[index],
+            "assignment": (
+                list(_OBJECT_ASSIGNMENT) if len(sources[index]) > 1 else [0] * _NUM_ENVS
+            ),
+            "variants": [_record(mujoco, source, entity) for source in sources[index]],
+        }
+        for index, entity in enumerate(entities)
+    ]
+    roots = np.zeros((_NUM_ENVS, len(entities), 13), dtype=np.float32)
+    roots[:, :, :7] = poses
+    qpos, qvel = (
+        np.zeros((_NUM_ENVS, layout.nq)),
+        np.zeros((_NUM_ENVS, layout.nv)),
+    )
+    qpos[:, 1:8] = poses[1]
+    if floating_robot:
+        qpos[:, 8:15] = poses[0]
+    if floating_passive:
+        qpos[:, 9:16], qvel[:, 7] = poses[-1], 0.2
+    return layout, {
+        "num_envs": _NUM_ENVS,
+        "sim_dt": 0.005,
+        "device_id": 0,
+        "render_mode": "none",
+        "scene_layout": layout.to_dict(),
+        "scene_content_identity": {
+            "profile": "portable-mjcf-v1",
+            "schema_version": 1,
+            "source_identity": "a" * 64,
+            "compiler_identity": "b" * 64,
+            "canonical_identity": "c" * 64,
+        },
+        "scene_entities": entries,
+        "initial_qpos": qpos.tolist(),
+        "initial_qvel": qvel.tolist(),
+        "initial_roots": roots.tolist(),
+        "gravity": [0, 0, -9.81],
+    }
+
+
+class _NativeWorker:
+    def __init__(self, directory: Path):
+        runtime = resolve_isaacsim_runtime()
+        worker = Path(__file__).resolve().parents[3] / "src" / "unisim" / "backend"
+        command = [
+            str(runtime.python),
+            str((worker / "isaacsim" / "worker.py").resolve()),
+            "--protocol",
+            str(Path(protocol.__file__).resolve()),
+        ]
+        (directory / "command.json").write_text(json.dumps(command, indent=2), encoding="utf-8")
+        self.log_path = directory / "stderr.log"
+        self.log = self.log_path.open("wb")
+        self.process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self.log,
+            env=build_worker_env(runtime),
+            bufsize=0,
+        )
+        self.memory = []
+
+    def request(self, command, payload=None, timeout=60):
+        protocol.send_message(self.process.stdin, command, payload)
+        deadline = time.monotonic() + timeout
+        header = _read_exactly_with_deadline(self.process.stdout, protocol.HEADER_SIZE, deadline)
+        body = _read_exactly_with_deadline(
+            self.process.stdout, protocol.unpack_header(header), deadline
+        )
+        message = protocol.decode_message(body)
+        if message["cmd"] == protocol.CMD_ERROR:
+            raise AssertionError(f"{message['payload']}\nWorker log: {self.log_path}")
+        expected = protocol.CMD_META if command == protocol.CMD_INIT else protocol.CMD_READY
+        assert message["cmd"] == expected
+        return message.get("payload")
+
+    def attach(self, layout, num_contact_force_sensors: int = 0):
+        slots, specs = {}, {}
+        for name, shape in protocol.scene_slot_shapes(
+            _NUM_ENVS, layout, num_contact_force_sensors
+        ).items():
+            memory = shared_memory.SharedMemory(
+                create=True, size=protocol.slot_allocation_nbytes(name, shape)
+            )
+            self.memory.append(memory)
+            slots[name] = np.ndarray(shape, dtype=protocol.slot_dtype(name), buffer=memory.buf)
+            slots[name].fill(0)
+            specs[name] = {
+                "shm": memory.name,
+                "shape": list(shape),
+                "dtype": str(protocol.slot_dtype(name)),
+            }
+        self.request(protocol.CMD_ATTACH, {"slots": specs})
+        return slots
+
+    def close(self):
+        if self.process.poll() is None:
+            try:
+                protocol.send_message(self.process.stdin, protocol.CMD_SHUTDOWN)
+                self.process.wait(timeout=20)
+            except (OSError, subprocess.TimeoutExpired):
+                self.process.kill()
+                self.process.wait(timeout=10)
+        self.process.stdin.close()
+        self.process.stdout.close()
+        for memory in self.memory:
+            memory.close()
+            memory.unlink()
+        self.log.close()
+
+
+def test_real_collision_pair_sensor_reports_static_support_force(tmp_path: Path):
+    layout, payload = _scene(tmp_path, "passive")
+    payload["contact_force_sensors"] = [{
+        "name": "object_table",
+        "source_entity": "object",
+        "source_body": "box",
+        "target_entity": "table",
+        "target_body": "table",
+    }]
+    (tmp_path / "init.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    worker = _NativeWorker(tmp_path)
+    try:
+        worker.request(protocol.CMD_INIT, payload, timeout=240)
+        slots = worker.attach(layout, 1)
+        worker.request(protocol.CMD_STEP, {"nsteps": 600})
+        force = slots["contact_sensor_force"][:, 0].copy()
+        assert np.all(np.isfinite(force))
+        expected_force = np.asarray([9.81, 19.62])[_OBJECT_ASSIGNMENT]
+        np.testing.assert_allclose(force[:, 2], expected_force, rtol=0.15, atol=0.05)
+        np.testing.assert_allclose(force[:, :2], 0.0, atol=0.5)
+        np.testing.assert_allclose(
+            slots["entity_root_state"][:, 1, 2], 0.43, atol=0.02
+        )
+        (tmp_path / "result.json").write_text(
+            json.dumps(
+                {
+                    "result": "passed",
+                    "force": force.tolist(),
+                    "object_z": slots["entity_root_state"][:, 1, 2].tolist(),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    finally:
+        worker.close()
+
+
+def test_real_mapped_scene_reports_per_entity_self_collision(tmp_path: Path):
+    # A fixed robot exercises the root-prim re-authoring bake path, while the
+    # floating passive articulation keeps the importer-authored prim; INIT
+    # audits the PhysX flag on every spawned instance before reporting it.
+    layout, payload = _scene(tmp_path, "passive_float")
+    for entry in payload["scene_entities"]:
+        entry["self_collision"] = entry["name"] in ("robot", "passive")
+    (tmp_path / "init.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    worker = _NativeWorker(tmp_path)
+    try:
+        meta = worker.request(protocol.CMD_INIT, payload, timeout=240)
+        (tmp_path / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        collision_filter = meta["configuration_report"]["effective"]["collision_filter"]
+        assert collision_filter["self_collision"] == {
+            "robot": True,
+            "object": False,
+            "table": False,
+            "mirror": False,
+            "passive": True,
+        }
+        assert collision_filter["environment_isolation"] is True
+        assert collision_filter["implicit_ground"] is False
+        slots = worker.attach(layout)
+        worker.request(protocol.CMD_STEP, {"nsteps": 10})
+        assert np.all(np.isfinite(slots["entity_root_state"]))
+    finally:
+        worker.close()
+
+
+def test_real_mapped_scene_reports_per_entity_gravity_disabled(tmp_path: Path):
+    # Explicit values differ from the implicit role default on purpose: the
+    # bake authors physxRigidBody:disableGravity from the resolved request,
+    # the role audit compares every body against it, and INIT reports the
+    # resolved flag per entity. The gravity-disabled floating object must not
+    # fall, which is the physical proof that the request was honored.
+    layout, payload = _scene(tmp_path, "passive")
+    requested = {
+        "robot": True,
+        "object": True,
+        "table": False,
+        "mirror": False,
+        "passive": True,
+    }
+    for entry in payload["scene_entities"]:
+        entry["gravity_disabled"] = requested[entry["name"]]
+    (tmp_path / "init.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    worker = _NativeWorker(tmp_path)
+    try:
+        meta = worker.request(protocol.CMD_INIT, payload, timeout=240)
+        (tmp_path / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        effective = meta["configuration_report"]["effective"]
+        assert effective["entity_gravity_disabled"] == requested
+        slots = worker.attach(layout)
+        worker.request(protocol.CMD_STEP, {"nsteps": 200})
+        assert np.all(np.isfinite(slots["entity_root_state"]))
+        # The object spawns at z=1 above the table; with gravity disabled it
+        # stays put instead of falling like the identity test's object does.
+        np.testing.assert_allclose(
+            slots["entity_root_state"][:, 1, 2], 1.0, atol=1e-3
+        )
+        (tmp_path / "result.json").write_text(
+            json.dumps(
+                {
+                    "result": "passed",
+                    "object_z": slots["entity_root_state"][:, 1, 2].tolist(),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize("mode", ["floating", "passive", "passive_float"])
+def test_real_mapped_scene_identity_reset_and_physics(tmp_path: Path, mode: str):
+    layout, payload = _scene(tmp_path, mode)
+    (tmp_path / "init.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    worker = _NativeWorker(tmp_path)
+    try:
+        meta = worker.request(protocol.CMD_INIT, payload, timeout=240)
+        (tmp_path / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        actual = {entry["name"]: entry for entry in meta["scene_entities_actual"]}
+        assert (
+            actual["object"]["assignment"]
+            == actual["mirror"]["assignment"]
+            == _OBJECT_ASSIGNMENT
+        )
+        expected_masses = [[2.0], [2.0], [1.0], [2.0], [1.0]]
+        np.testing.assert_allclose(
+            actual["object"]["body_mass"], expected_masses, atol=1e-6
+        )
+        assert len(actual["robot"]["body_sphere_radii"]) == _NUM_ENVS
+        for robot_radii in actual["robot"]["body_sphere_radii"]:
+            assert robot_radii[1] == []
+            np.testing.assert_allclose(robot_radii[0], [0.1], atol=1e-8)
+        assert actual["object"]["body_sphere_radii"] == [[[]]] * _NUM_ENVS
+        assert meta["scene_layout"]["nu"] == 1
+        assert meta["scene_layout"]["ngeom"] == layout.ngeom
+        assert actual["robot"]["geom_names"] == [
+            ["base_geom", "base_pad", "tip::geom0"]
+        ] * _NUM_ENVS
+        assert actual["robot"]["geom_body_names"] == [["base", "base", "tip"]] * _NUM_ENVS
+        for declared_entry in payload["scene_entities"]:
+            record = actual[declared_entry["name"]]
+            count = len(declared_entry["variants"][0]["geom_names"])
+            expected_mask = int(declared_entry["name"] != "mirror")
+            np.testing.assert_array_equal(
+                record["geom_contact_masks"],
+                [[[expected_mask, expected_mask]] * count] * _NUM_ENVS,
+            )
+            expected_sliding = np.asarray(
+                [
+                    declared_entry["variants"][variant]["geom_friction"][0][0]
+                    for variant in declared_entry["assignment"]
+                ]
+            )
+            reported_friction = np.asarray(record["geom_friction"])
+            np.testing.assert_allclose(reported_friction[:, 0, 0], expected_sliding)
+            np.testing.assert_allclose(reported_friction[:, 0, 1], expected_sliding)
+            np.testing.assert_allclose(reported_friction[:, 0, 2], 0.0)
+            np.testing.assert_allclose(actual["robot"]["geom_friction"][0][1], [0.4, 0.4, 0.0])
+        np.testing.assert_allclose(
+            np.asarray(actual["object"]["geom_friction"])[:, 0, :2],
+            [[0.4, 0.4], [0.4, 0.4], [0.9, 0.9], [0.4, 0.4], [0.9, 0.9]],
+        )
+        slots = worker.attach(layout)
+        before = slots["entity_root_state"].copy()
+        worker.request(protocol.CMD_STEP, {"nsteps": 5})
+        fallen = slots["entity_root_state"].copy()
+        np.testing.assert_allclose(fallen[:, 1, 9], -9.81 * 0.005 * 5, atol=1e-5)
+        assert np.all(fallen[:, 1, 2] < before[:, 1, 2])
+        if mode == "floating":
+            assert np.all(fallen[:, 0, 2] < before[:, 0, 2])
+        else:
+            np.testing.assert_allclose(fallen[:, 0, :7], before[:, 0, :7], atol=1e-5)
+            assert np.all(np.abs(slots["qvel"][:, 7]) > 0.001)
+        slots["reset_env_ids"][0] = 1
+        slots["reset_qpos"][0] = slots["qpos"][1]
+        slots["reset_qvel"][0] = slots["qvel"][1]
+        slots["reset_entity_root_state"][0] = fallen[1]
+        slots["reset_entity_root_state"][0, 1, :3] = [0.1, 0.2, 1.7]
+        slots["reset_entity_root_state"][0, 1, 7:] = 0
+        slots["reset_qpos"][0, 1:8] = [0.1, 0.2, 1.7, 1, 0, 0, 0]
+        slots["reset_qvel"][0, 1:7] = 0
+        slots["reset_qpos_mask"][1:8] = 1
+        slots["reset_qvel_mask"][1:7] = 1
+        slots["reset_root_mask"][1] = 1
+        worker.request(protocol.CMD_RESET_ENTITIES, {"count": 1, "entity_names": ["object"]})
+        after = slots["entity_root_state"].copy()
+        np.testing.assert_allclose(after[1, 1, :3], [0.1, 0.2, 1.7], atol=1e-5)
+        np.testing.assert_array_equal(after[0], fallen[0])
+        other_entities = [i for i in range(len(layout.entities)) if i != 1]
+        np.testing.assert_array_equal(after[:, other_entities], fallen[:, other_entities])
+        worker.request(protocol.CMD_STEP, {"nsteps": 1})
+        assert slots["entity_root_state"][1, 1, 2] > 1.69
+        # Nonidentity orientation and offset COM distinguish link and COM velocity.
+        slots["reset_entity_root_state"][0, 1, :7] = [
+            0.1,
+            0.2,
+            1.7,
+            np.sqrt(0.5),
+            0,
+            0,
+            np.sqrt(0.5),
+        ]
+        slots["reset_entity_root_state"][0, 1, 7:] = [0.1, 0.2, 0.3, 1, 2, 3]
+        slots["reset_qpos"][0, 1:8] = slots["reset_entity_root_state"][0, 1, :7]
+        slots["reset_qvel"][0, 1:7] = [0.1, 0.2, 0.3, 2, -1, 3]
+        worker.request(protocol.CMD_RESET_ENTITIES, {"count": 1, "entity_names": ["object"]})
+        np.testing.assert_allclose(
+            slots["entity_root_state"][1, 1, 7:], [0.1, 0.2, 0.3, 1, 2, 3], atol=1e-5
+        )
+        np.testing.assert_allclose(slots["qvel"][1, 1:7], [0.1, 0.2, 0.3, 2, -1, 3], atol=1e-5)
+        # Co-locate the collision-free mirror and compare against the far baseline.
+        slots["reset_env_ids"][:] = np.arange(slots["reset_env_ids"].shape[0])
+        slots["reset_qpos"][:] = slots["qpos"]
+        slots["reset_qvel"][:] = slots["qvel"]
+        slots["reset_entity_root_state"][:] = slots["entity_root_state"]
+        slots["reset_entity_root_state"][:, 1] = before[:, 1]
+        slots["reset_entity_root_state"][:, 3, :7] = before[:, 1, :7]
+        slots["reset_qpos"][:, 1:8] = before[:, 1, :7]
+        slots["reset_qvel"][:, 1:7] = 0
+        slots["reset_root_mask"][3, 0] = 1
+        worker.request(
+            protocol.CMD_RESET_ENTITIES, {"count": 5, "entity_names": ["object", "mirror"]}
+        )
+        worker.request(protocol.CMD_STEP, {"nsteps": 5})
+        near = slots["entity_root_state"][:, 1].copy()
+        np.testing.assert_allclose(near, fallen[:, 1], atol=1e-5)
+        slots["ctrl"][:, 0] = 0.4
+        worker.request(protocol.CMD_STEP, {"nsteps": 40})
+        assert np.all(slots["qpos"][:, 0] > 0.01)
+        result = {
+            "initial": before.tolist(),
+            "fallen": fallen.tolist(),
+            "reset": after.tolist(),
+            "mirror_near": near.tolist(),
+            "controlled_hinge": slots["qpos"][:, 0].tolist(),
+        }
+        (tmp_path / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    finally:
+        worker.close()
+
+
+def _canonical_property_tables(payload, layout):
+    """Assemble canonical (num_envs, nbody[/3]) and geom tables from variants."""
+    mass = np.zeros((_NUM_ENVS, layout.nbody))
+    ipos = np.zeros((_NUM_ENVS, layout.nbody, 3))
+    inertia = np.zeros((_NUM_ENVS, layout.nbody, 3))
+    friction = np.zeros((_NUM_ENVS, layout.ngeom, 3))
+    geom_offset = 0
+    for entity, entry in zip(layout.entities, payload["scene_entities"]):
+        columns = list(entity.body_ids)
+        for env, variant in enumerate(entry["assignment"]):
+            record = entry["variants"][variant]
+            mass[env, columns] = record["body_mass"]
+            ipos[env, columns] = record["body_ipos"]
+            inertia[env, columns] = record["body_inertia"]
+            for geom, row in enumerate(record["geom_friction"]):
+                friction[env, geom_offset + geom] = [row[0], row[0], 0.0]
+        geom_offset += len(entity.geoms)
+    return mass, ipos, inertia, friction
+
+
+def test_real_mapped_scene_reset_randomization(tmp_path: Path):
+    # Per-env reset DR over drive gains, DOF parameters, and mass properties,
+    # plus a second robot variant so INIT itself audits per-env variant gains.
+    layout, payload = _scene(tmp_path, "passive")
+    mujoco = pytest.importorskip("mujoco")
+    robot_variant = tmp_path / "robot2.xml"
+    robot_variant.write_text(
+        _ROBOT.replace('kp="10" kv="1"', 'kp="25" kv="2.5"'), encoding="utf-8"
+    )
+    robot_entry = payload["scene_entities"][0]
+    robot_entry["sources"].append(str(robot_variant))
+    robot_entry["variants"].append(_record(mujoco, str(robot_variant), layout.entities[0]))
+    robot_entry["assignment"] = [0, 1, 1, 0, 1]
+    payload["contact_force_sensors"] = [
+        {
+            "name": "object_table",
+            "source_entity": "object",
+            "source_body": "box",
+            "target_entity": "table",
+            "target_body": "table",
+        }
+    ]
+    (tmp_path / "init.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    worker = _NativeWorker(tmp_path)
+    try:
+        # INIT passing already proves the per-env variant drive-gain audit:
+        # envs 1/2/4 carry kp=25/kv=2.5 while envs 0/3 carry kp=10/kv=1.
+        worker.request(protocol.CMD_INIT, payload, timeout=240)
+        slots = worker.attach(layout, 1)
+
+        mass, ipos, inertia, friction = _canonical_property_tables(payload, layout)
+        object_masses = [3.0, 0.5, 1.5, 2.5, 1.0]
+        mass[:, 2] = object_masses
+        ipos[0, 6] = [0.12, 0.0, 0.0]  # passive pendulum COM, env 0 only
+        inertia[0, 6] = [0.0015, 0.002, 0.003]
+        friction[0, 3] = [0.1, 0.1, 0.0]  # object geom, env 0 only
+        kp = [[40.0], [0.0], [25.0], [10.0], [5.0]]
+        kd = [[4.0], [0.0], [2.5], [1.0], [0.5]]
+        dof_damping = np.zeros((_NUM_ENVS, layout.nv))
+        dof_armature = np.zeros((_NUM_ENVS, layout.nv))
+        dof_frictionloss = np.zeros((_NUM_ENVS, layout.nv))
+        dof_damping[:, 0] = [0.3, 0.0, 0.2, 0.1, 0.05]
+        dof_damping[:, 7] = [0.1, 0.2, 0.05, 0.0, 0.3]
+        dof_armature[:, 0] = [0.02, 0.0, 0.01, 0.03, 0.0]
+        dof_armature[:, 7] = [0.01, 0.02, 0.0, 0.04, 0.01]
+        dof_frictionloss[:, 0] = [0.05, 0.0, 0.02, 0.01, 0.03]
+        dof_frictionloss[:, 7] = [0.02, 0.01, 0.03, 0.0, 0.02]
+        slots["reset_env_ids"][:] = np.arange(_NUM_ENVS)
+        response = worker.request(
+            protocol.CMD_RESET_ENTITIES,
+            {
+                "count": _NUM_ENVS,
+                "entity_names": [entity.name for entity in layout.entities],
+                "randomization": {
+                    "kp": kp,
+                    "kd": kd,
+                    "dof_damping": dof_damping.tolist(),
+                    "dof_armature": dof_armature.tolist(),
+                    "dof_frictionloss": dof_frictionloss.tolist(),
+                    "body_mass": mass.tolist(),
+                    "body_ipos": ipos.tolist(),
+                    "body_inertia": inertia.tolist(),
+                    "geom_friction": friction.tolist(),
+                },
+            },
+        )
+        records = {record["name"]: record for record in response["native_entity_records"]}
+        np.testing.assert_allclose(
+            np.asarray(records["robot"]["dof_stiffness"])[:, 0],
+            np.asarray(kp)[:, 0],
+            rtol=2e-5,
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            np.asarray(records["robot"]["dof_damping"])[:, 0],
+            np.asarray(kd)[:, 0] + dof_damping[:, 0],
+            rtol=2e-5,
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            np.asarray(records["robot"]["dof_armature"])[:, 0],
+            dof_armature[:, 0],
+            rtol=2e-5,
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            np.asarray(records["robot"]["dof_friction"])[:, 0],
+            dof_frictionloss[:, 0],
+            rtol=2e-5,
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            np.asarray(records["passive"]["dof_damping"])[:, 0],
+            dof_damping[:, 7],
+            rtol=2e-5,
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            records["robot"]["body_mass"], [[1.0, 0.5]] * _NUM_ENVS, atol=1e-6
+        )
+        np.testing.assert_allclose(
+            np.asarray(records["object"]["body_mass"])[:, 0], object_masses, atol=1e-6
+        )
+        np.testing.assert_allclose(
+            np.asarray(records["mirror"]["body_mass"])[:, 0],
+            [2.0, 2.0, 1.0, 2.0, 1.0],
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            np.asarray(records["table"]["body_mass"])[:, 0], 5.0, atol=1e-6
+        )
+        np.testing.assert_allclose(
+            np.asarray(records["passive"]["body_com"])[0, 1], [0.12, 0.0, 0.0], atol=1e-6
+        )
+        np.testing.assert_allclose(
+            np.asarray(records["passive"]["body_com"])[1:, 1],
+            [[0.1, 0.0, 0.0]] * (_NUM_ENVS - 1),
+            atol=1e-6,
+        )
+        env0_inertia = np.asarray(records["passive"]["body_inertia"])[0, 1]
+        np.testing.assert_allclose(
+            np.diagonal(env0_inertia), [0.0015, 0.002, 0.003], rtol=2e-5, atol=1e-6
+        )
+        np.testing.assert_allclose(
+            env0_inertia - np.diag(np.diagonal(env0_inertia)), 0.0, atol=1e-6
+        )
+        np.testing.assert_allclose(
+            np.asarray(records["object"]["geom_friction"])[:, 0],
+            [
+                [0.1, 0.1, 0.0],
+                [0.4, 0.4, 0.0],
+                [0.9, 0.9, 0.0],
+                [0.4, 0.4, 0.0],
+                [0.9, 0.9, 0.0],
+            ],
+            atol=1e-6,
+        )
+
+        # Post-reset dynamics honor the new gains: env 1 has kp=kd=0, so its
+        # hinge stays put while the tracked envs chase the position target.
+        slots["ctrl"][:, 0] = 0.5
+        worker.request(protocol.CMD_STEP, {"nsteps": 60})
+        hinge = slots["qpos"][:, 0].copy()
+        assert abs(hinge[1]) < 0.02
+        np.testing.assert_array_less(0.05, np.abs(hinge[[0, 2, 3, 4]]))
+
+        # Drop the objects with the randomized masses; the support force and
+        # rest height must reflect the values written by the reset above.
+        slots["reset_env_ids"][:] = np.arange(_NUM_ENVS)
+        slots["reset_qpos"][:] = 0
+        slots["reset_qvel"][:] = 0
+        slots["reset_qpos"][:, 1:8] = [0.3, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0]
+        slots["reset_entity_root_state"][:] = 0
+        slots["reset_entity_root_state"][:, 1, :7] = [0.3, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0]
+        slots["reset_qpos_mask"][:] = 0
+        slots["reset_qvel_mask"][:] = 0
+        slots["reset_root_mask"][:] = 0
+        slots["reset_qpos_mask"][1:8] = 1
+        slots["reset_qvel_mask"][1:7] = 1
+        slots["reset_root_mask"][1] = 1
+        worker.request(
+            protocol.CMD_RESET_ENTITIES, {"count": _NUM_ENVS, "entity_names": ["object"]}
+        )
+        worker.request(protocol.CMD_STEP, {"nsteps": 600})
+        force = slots["contact_sensor_force"][:, 0].copy()
+        assert np.all(np.isfinite(force))
+        np.testing.assert_allclose(
+            force[:, 2], np.asarray(object_masses) * 9.81, rtol=0.15, atol=0.05
+        )
+        np.testing.assert_allclose(slots["entity_root_state"][:, 1, 2], 0.43, atol=0.02)
+        (tmp_path / "result.json").write_text(
+            json.dumps(
+                {
+                    "result": "passed",
+                    "hinge": hinge.tolist(),
+                    "force": force.tolist(),
+                    "object_z": slots["entity_root_state"][:, 1, 2].tolist(),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    finally:
+        worker.close()

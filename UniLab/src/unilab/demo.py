@@ -1,0 +1,224 @@
+"""Demo entrypoint: fetch checkpoint from HF, then launch interactive playback."""
+
+from __future__ import annotations
+
+import os
+import platform
+import shutil
+import subprocess
+import sys
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+
+from unilab.assets import ASSETS_ROOT_PATH
+from unilab.assets.hub import resolve_checkpoint_file
+
+
+@dataclass(frozen=True)
+class DemoSpec:
+    algo: str
+    task: str
+    sim: str
+    entry: str  # "eval", "play_interactive", or "teaser"
+
+
+DEMO_REGISTRY: dict[str, DemoSpec] = {
+    "dance": DemoSpec(algo="ppo", task="g1_motion_tracking", sim="motrix", entry="eval"),
+    "boxtracking": DemoSpec(algo="ppo", task="g1_box_tracking", sim="motrix", entry="eval"),
+    "teaser": DemoSpec(algo="", task="", sim="", entry="teaser"),
+}
+
+_LOCAL_ONLY_CHECKPOINT_DEMOS: set[str] = set()
+_DEMO_PLAY_INTERACTIVE_OVERRIDES: dict[str, tuple[str, ...]] = {}
+
+
+def _package_root() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _dev_venv() -> Path | None:
+    """Return the editable checkout's uv venv, or None for pip installs."""
+    venv = Path(__file__).resolve().parents[2] / ".venv"
+    return venv if venv.is_dir() else None
+
+
+def get_demo_spec(demo_name: str) -> DemoSpec:
+    try:
+        return DEMO_REGISTRY[demo_name]
+    except KeyError as exc:
+        available = ", ".join(sorted(DEMO_REGISTRY))
+        raise SystemExit(f"Unknown demo {demo_name!r}. Available demos: {available}") from exc
+
+
+def _checkpoint_relative_path(demo_name: str) -> str:
+    return f"checkpoints/{demo_name}/model_0.pt"
+
+
+def _local_checkpoint_path(demo_name: str) -> Path:
+    return ASSETS_ROOT_PATH / _checkpoint_relative_path(demo_name)
+
+
+def _refresh_local_checkpoint(demo_name: str) -> None:
+    local = _local_checkpoint_path(demo_name)
+    if local.exists():
+        local.unlink()
+
+
+def _resolve_demo_checkpoint(demo_name: str) -> str | None:
+    local = _local_checkpoint_path(demo_name)
+    if demo_name not in _LOCAL_ONLY_CHECKPOINT_DEMOS:
+        resolved = resolve_checkpoint_file(_checkpoint_relative_path(demo_name))
+        assert isinstance(resolved, str)
+        return resolved
+
+    if local.exists():
+        return str(local)
+
+    print(
+        f"Local checkpoint not found for demo {demo_name!r}: {local}\n"
+        "Checkpoint not found; no download source is used for this demo.\n"
+        "Place the stage-2 PyTorch checkpoint at this path and run the demo again."
+    )
+    return None
+
+
+def _build_play_interactive_command(
+    *,
+    spec: DemoSpec,
+    checkpoint_path: str,
+    extra_overrides: Sequence[str],
+    root: Path | None = None,
+) -> list[str]:
+    selected_root = root or _package_root()
+    script = selected_root / "scripts" / "play_interactive.py"
+    if not script.is_file():
+        raise SystemExit(f"Entrypoint script not found: {script}")
+    owner_yaml = selected_root / "conf" / spec.algo / "task" / spec.task / f"{spec.sim}.yaml"
+    if not owner_yaml.is_file():
+        raise SystemExit(
+            f"No owner config exists for algo={spec.algo}, task={spec.task}, sim={spec.sim}: "
+            f"{owner_yaml}"
+        )
+    command = [
+        *_play_interactive_command_prefix(),
+        str(script),
+        "--algo",
+        spec.algo,
+        "--task",
+        spec.task,
+        "--sim",
+        spec.sim,
+    ]
+    command.extend(
+        [
+            f"algo.load_run={checkpoint_path}",
+            *extra_overrides,
+        ]
+    )
+    return command
+
+
+def _play_interactive_command_prefix() -> list[str]:
+    if platform.system() != "Darwin":
+        return [sys.executable]
+
+    _ensure_mujoco_mjpython_app()
+    return [_current_env_mjpython()]
+
+
+def _ensure_mujoco_mjpython_app() -> None:
+    from unilab.cli import _ensure_mujoco_mjpython_app as ensure_app
+
+    ensure_app()
+
+
+def _current_env_mjpython() -> str:
+    from unilab.cli import _mjpython_executable as resolve_mjpython
+
+    return resolve_mjpython()
+
+
+def build_demo_command(
+    *,
+    demo_name: str,
+    checkpoint_path: str,
+    device: str | None = None,
+    root: Path | None = None,
+) -> list[str]:
+    """Assemble the subprocess command for a given demo + resolved checkpoint."""
+    from unilab.cli import build_command
+
+    spec = get_demo_spec(demo_name)
+    extra: list[str] = []
+    if device is not None:
+        extra.append(f"training.device={device}")
+    extra.extend(_DEMO_PLAY_INTERACTIVE_OVERRIDES.get(demo_name, ()))
+
+    if spec.entry == "eval":
+        return build_command(
+            mode="eval",
+            algo=spec.algo,
+            task=spec.task,
+            sim=spec.sim,
+            overrides=[f"algo.load_run={checkpoint_path}", *extra],
+            root=root,
+        )
+    if spec.entry == "play_interactive":
+        return _build_play_interactive_command(
+            spec=spec, checkpoint_path=checkpoint_path, extra_overrides=extra, root=root
+        )
+    if spec.entry == "teaser":
+        raise SystemExit(
+            f"Demo {demo_name!r} is a renderer-only entry and has no subprocess command."
+        )
+    raise SystemExit(f"Unknown demo entry kind: {spec.entry!r}")
+
+
+def _mxpython_executable() -> str:
+    from unilab.cli import _mxpython_executable as resolve_mxpython_executable
+
+    return resolve_mxpython_executable()
+
+
+def _run_teaser_demo() -> int:
+    if platform.system() == "Darwin" and Path(sys.executable).name != "mxpython":
+        command = [
+            _mxpython_executable(),
+            str(_package_root() / "visualization" / "teaser.py"),
+        ]
+        env = os.environ.copy()
+        dev_venv = _dev_venv()
+        if dev_venv is not None:
+            env["UV_PROJECT_ENVIRONMENT"] = str(dev_venv)
+        return subprocess.run(command, check=False, env=env).returncode
+
+    from unilab.visualization.teaser import main as render_teaser_main
+
+    render_teaser_main()
+    return 0
+
+
+def run_demo(*, demo_name: str, refresh: bool = False, device: str | None = None) -> int:
+    spec = get_demo_spec(demo_name)
+    if spec.entry == "teaser":
+        return _run_teaser_demo()
+    if refresh and demo_name not in _LOCAL_ONLY_CHECKPOINT_DEMOS:
+        _refresh_local_checkpoint(demo_name)
+    elif refresh:
+        print(f"Refresh ignored for local-only demo {demo_name!r}; no download source is used.")
+    checkpoint_path = _resolve_demo_checkpoint(demo_name)
+    if checkpoint_path is None:
+        return 1
+
+    command = build_demo_command(
+        demo_name=demo_name, checkpoint_path=checkpoint_path, device=device
+    )
+    env = os.environ.copy()
+    dev_venv = _dev_venv()
+    if dev_venv is not None:
+        env["UV_PROJECT_ENVIRONMENT"] = str(dev_venv)
+    returncode = subprocess.run(command, check=False, env=env).returncode
+    if returncode == 0:
+        print(f"Demo finished: {demo_name} (algo={spec.algo}, task={spec.task}, sim={spec.sim})")
+    return returncode

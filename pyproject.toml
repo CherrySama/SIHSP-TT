@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sihsp-tt-core"
+version = "0.1.0"
+description = "Simulator-independent ball trajectory prediction for SIHSP-TT"
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["ball_state", "ball_prediction", "rail_alignment"]
+
+[tool.ruff]
+line-length = 96
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

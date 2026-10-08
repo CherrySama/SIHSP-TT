@@ -1,0 +1,180 @@
+# @package _global_
+# Random serves use the same ServeLauncherCfg distribution as height preparation.
+# The config factory materializes the unlocked prepared scene on the cold path.
+env:
+  scene:
+    default_keyframe_name: home
+    entities:
+      robot:
+        root_body_name: rail_carriage
+        joint_names: [rail_joint, joint1, joint2, joint3, joint4, joint6]
+        body_names: [rail_carriage, paddle_frame, link6]
+        geom_names: [paddle_contact]
+        actuator_names: [rail_force, joint1_position, joint2_position, joint3_position, joint4_position, joint6_position]
+      ball:
+        root_body_name: ball
+        body_names: [ball]
+        geom_names: [ball_geom]
+  sim_dt: 0.00025
+  ctrl_dt: 0.01
+  max_episode_seconds: 4.0
+  seed: 7
+  auto_reset: true
+  scale_rewards_by_dt: false
+  observations:
+    policy:
+      _target_: unilab.managers.ObservationGroupCfg
+      terms:
+        return_state:
+          func: unilab.tasks.manipulation.table_tennis.return_control.return_observation
+        ball_history:
+          func: unilab.tasks.manipulation.table_tennis.return_control.return_ball_history
+          history_length: 5
+  actions:
+    return_control:
+      _target_: unilab.tasks.manipulation.table_tennis.return_control.PantheraReturnActionCfg
+      entity_name: robot
+      yaw_velocity: 3.0
+      tilt_velocity: 3.0
+      yaw_acceleration: 12.0
+      tilt_acceleration: 20.0
+      residual_control: true
+      rail_offset: 0.03
+      arm_offset: 0.03
+      rail_adjustment_velocity: 0.2
+      rail_adjustment_acceleration: 2.0
+      arm_adjustment_velocity: 0.5
+      arm_adjustment_acceleration: 4.0
+      handoff_duration: 0.05
+      guidance:
+        _target_: unilab.tasks.manipulation.table_tennis.return_guidance.ReturnGuidanceCfg
+        gravity: 9.81
+        horizon: 0.5
+        sample_dt: 0.01
+        freshness: 0.05
+        tolerance: 0.02
+        distance_scale: 0.06
+        fade_far: 0.16
+        fade_near: 0.06
+        strike_far: 0.20
+        strike_near: 0.10
+        velocity_scale: 0.8
+        paddle_radius: 0.07
+        paddle_half_thickness: 0.00725
+        ball_radius: 0.02
+  events:
+    reset_scene_to_default:
+      _target_: unilab.managers.EventTermCfg
+      func: unilab.envs.mdp.reset_scene_to_default
+      mode: reset
+    launch_ball:
+      _target_: unilab.managers.EventTermCfg
+      func: unilab.tasks.manipulation.table_tennis.ball_launcher.launch_random_ball
+      mode: reset
+      params:
+        launcher_cfg:
+          _target_: unilab.tasks.manipulation.table_tennis.ball_launcher.ServeLauncherCfg
+        asset_cfg:
+          _target_: unilab.managers.SceneEntityCfg
+          name: ball
+  terminations:
+    return_result:
+      _target_: unilab.managers.TerminationTermCfg
+      func: unilab.tasks.manipulation.table_tennis.return_control.return_done
+    time_out:
+      _target_: unilab.managers.TerminationTermCfg
+      func: unilab.envs.mdp.time_out
+      time_out: true
+  metrics:
+    success:
+      _target_: unilab.managers.MetricsTermCfg
+      func: unilab.tasks.manipulation.table_tennis.return_control.return_metric
+      params: {condition: success}
+      reduce: last
+    hit:
+      _target_: unilab.managers.MetricsTermCfg
+      func: unilab.tasks.manipulation.table_tennis.return_control.return_metric
+      params: {condition: hit}
+      reduce: last
+    crossed_net:
+      _target_: unilab.managers.MetricsTermCfg
+      func: unilab.tasks.manipulation.table_tennis.return_control.return_metric
+      params: {condition: crossed_net}
+      reduce: last
+    preparation_failed:
+      _target_: unilab.managers.MetricsTermCfg
+      func: unilab.tasks.manipulation.table_tennis.return_control.return_metric
+      params: {condition: preparation_failed}
+      reduce: last
+  policy_observation_group: policy
+  critic_observation_group: null
+
+reward:
+  first_hit:
+    _target_: unilab.managers.RewardTermCfg
+    func: unilab.tasks.manipulation.table_tennis.return_control.return_reward
+    weight: 0.10
+    params: {event: hit}
+  crossed_net:
+    _target_: unilab.managers.RewardTermCfg
+    func: unilab.tasks.manipulation.table_tennis.return_control.return_reward
+    weight: 0.50
+    params: {event: crossed_net}
+  success:
+    _target_: unilab.managers.RewardTermCfg
+    func: unilab.tasks.manipulation.table_tennis.return_control.return_reward
+    weight: 10.0
+    params: {event: success}
+  failure:
+    _target_: unilab.managers.RewardTermCfg
+    func: unilab.tasks.manipulation.table_tennis.return_control.return_reward
+    weight: -5.0
+    params: {event: failure}
+  adjustment_cost:
+    _target_: unilab.managers.RewardTermCfg
+    func: unilab.tasks.manipulation.table_tennis.return_control.return_control_cost
+    weight: -0.02
+    params: {component: offset}
+  acceleration_cost:
+    _target_: unilab.managers.RewardTermCfg
+    func: unilab.tasks.manipulation.table_tennis.return_control.return_control_cost
+    weight: -0.01
+    params: {component: acceleration}
+  reaching:
+    _target_: unilab.managers.RewardTermCfg
+    func: unilab.tasks.manipulation.table_tennis.return_control.return_guidance_reward
+    weight: 0.30
+    params: {component: reach}
+  striking:
+    _target_: unilab.managers.RewardTermCfg
+    func: unilab.tasks.manipulation.table_tennis.return_control.return_guidance_reward
+    weight: 0.20
+    params: {component: strike}
+  outgoing_direction:
+    _target_: unilab.managers.RewardTermCfg
+    func: unilab.tasks.manipulation.table_tennis.return_control.return_shaping_reward
+    weight: 0.20
+    params:
+      component: direction
+      shaping_cfg: &shot_quality
+        _target_: unilab.tasks.manipulation.table_tennis.return_shaping.ReturnShapingCfg
+        gravity: 9.81
+        forward_speed: 3.0
+        net_clearance: 0.08
+        net_height_scale: 0.18
+        landing_x_scale: 0.75
+        landing_y_scale: 0.25
+  predicted_net_height:
+    _target_: unilab.managers.RewardTermCfg
+    func: unilab.tasks.manipulation.table_tennis.return_control.return_shaping_reward
+    weight: 0.50
+    params:
+      component: net_height
+      shaping_cfg: *shot_quality
+  predicted_landing:
+    _target_: unilab.managers.RewardTermCfg
+    func: unilab.tasks.manipulation.table_tennis.return_control.return_shaping_reward
+    weight: 1.30
+    params:
+      component: landing
+      shaping_cfg: *shot_quality

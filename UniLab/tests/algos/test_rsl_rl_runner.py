@@ -1,0 +1,96 @@
+"""Integration tests for RSL-RL PPO training.
+
+Requires MuJoCo and rsl_rl to be installed. Run with:
+    uv run pytest -m slow -v -k rsl_rl
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, cast
+
+import pytest
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
+
+pytest.importorskip("mujoco")
+pytest.importorskip(
+    "unisim.backend.mujoco.backend",
+    reason="unisim-core MuJoCo adapter (mjbatch build) not available",
+)
+rsl_rl = pytest.importorskip("rsl_rl")
+
+from unilab.base import registry
+from unilab.base.config_adapter import BackendAdapter
+from unilab.base.registry import ensure_registries
+from unilab.rl import RslRlVecEnvAdapter
+from unilab.structured_configs import PPOConfig
+
+ensure_registries()
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "env_name",
+    [
+        "Go2JoystickFlat",
+        "G1WalkFlat",
+        "AllegroInhandRotation",
+    ],
+)
+def test_rsl_rl_ppo_one_iteration(
+    env_name: str,
+):
+    """RSL-RL PPO can complete 1 training iteration on a real env."""
+    from rsl_rl.runners import OnPolicyRunner
+
+    num_envs = 256
+    root_dir = Path(__file__).parents[2]
+    if "Go2" in env_name:
+        task = "go2_joystick_flat/mujoco"
+    elif "G1" in env_name:
+        task = "g1_walk_flat/mujoco"
+    else:
+        num_envs = 128
+        task = "allegro_inhand/mujoco"
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(
+        config_dir=str(root_dir / "src" / "unilab" / "conf" / "ppo"), version_base="1.3"
+    ):
+        hydra_cfg = compose("config", overrides=[f"task={task}"])
+    env_cfg_override = BackendAdapter(hydra_cfg, root_dir=root_dir).build_task_env_cfg_override()
+
+    env = registry.make(
+        env_name,
+        num_envs=num_envs,
+        sim_backend="mujoco",
+        env_cfg_override=env_cfg_override,
+    )
+    wrapped = RslRlVecEnvAdapter(env, device="cpu")
+
+    cfg = PPOConfig()
+    train_cfg = cfg.to_dict()
+    if env_name == "Go2JoystickFlat":
+        train_cfg["obs_groups"] = {"actor": ["actor"], "critic": ["critic"]}
+    # Small network + short loop; large num_envs to saturate CPU
+    train_cfg["num_steps_per_env"] = 8
+    train_cfg["actor"]["hidden_dims"] = [64, 64]
+    train_cfg["critic"]["hidden_dims"] = [64, 64]
+    train_cfg["algorithm"]["num_learning_epochs"] = 1
+    train_cfg["algorithm"]["num_mini_batches"] = 2
+
+    # log_dir=None disables the logging writer (upstream v5 rejects "none").
+    runner = OnPolicyRunner(cast(Any, wrapped), train_cfg, log_dir=None, device="cpu")
+    try:
+        runner.learn(num_learning_iterations=1, init_at_random_ep_len=True)
+    finally:
+        writer = getattr(getattr(runner, "logger", None), "writer", None)
+        if writer is not None and hasattr(writer, "close"):
+            writer.close()
+
+    env.close()

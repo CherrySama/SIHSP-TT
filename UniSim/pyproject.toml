@@ -1,0 +1,126 @@
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "unisim"
+
+[project]
+name = "unisim-core"
+version = "1.7.5"
+description = "Unified physics backend contracts and adapters"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "UniSim Authors" }]
+requires-python = ">=3.10,<3.14"
+dependencies = ["numpy"]
+keywords = ["physics", "simulation", "robotics", "benchmark"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[project.optional-dependencies]
+# Portable MJCF scene compilation uses the public MuJoCo parser/compiler only;
+# it intentionally does not require the mjbatch native executor.
+scene-compiler = ["mujoco~=3.11.0"]
+# MuJoCo 3.11 alignment (unilabsim/UniLab#1515): the mujoco, mjwarp, and
+# newton extras share one MuJoCo 3.11 / MuJoCo-Warp 3.11 / warp-lang 1.16.0
+# line and are jointly installable. The `mujoco` bound is a compatible-release
+# specifier; `uv.lock` pins the exact MuJoCo version. The executor is the
+# unilabsim mjbatch fork (https://github.com/unilabsim/mjbatch_uni). The
+# per-env model-field, VariantPack, split-substep sensor-copyout, and selective
+# sensor-refresh APIs are published in the 0.2.2+ line.
+mujoco = [
+    "mujoco~=3.11.0",
+    "mjbatch-uni~=0.2.4",
+]
+motrix = ["motrixsim-core==0.10.1"]
+drake = ["drake-uni==0.1.0"]
+mjwarp = ["mujoco-warp~=3.11.0", "warp-lang==1.16.0"]
+genesis = ["genesis-world==1.3.3"]
+# The superdex-uni wheels are a temporary unilabsim build carrying the native
+# batch executor (CPython 3.12 and 3.13 ABIs) until the upstream
+# project_superdex PR merges; switch back to superdex-physics/-robotics then.
+# Other Python versions retain the NumPy-only base and fail with a targeted
+# dependency diagnostic if this adapter is requested.
+superdex = [
+    "superdex-physics-uni==1.3.0 ; python_version >= '3.12' and python_version < '3.14'",
+    "superdex-robotics-uni==1.3.0 ; python_version >= '3.12' and python_version < '3.14'",
+    "mujoco~=3.11.0 ; python_version >= '3.12' and python_version < '3.14'",
+]
+# Newton's upstream coupling is precise, so these stay exact pins. They sit on
+# the same 3.11 line as the extras above: newton 1.5.1 requires
+# warp-lang>=1.16.0, and mujoco-warp 3.11.0 accepts warp-lang>=1.14 and
+# mujoco>=3.9, so warp-lang==1.16.0 satisfies both.
+newton = [
+    "newton==1.5.1",
+    "mujoco-warp==3.11.0",
+    "mujoco==3.11.0",
+    "warp-lang==1.16.0",
+    # Newton's native ViewerGL is the default renderer for both playback
+    # recording and interactive evaluation, so its GUI stack is part of the
+    # backend extra rather than a separately-selected extra.
+    "pyglet>=2.1.6,<3",
+    "imgui-bundle>=1.92.0",
+]
+# Isaac SDKs are vendor-managed and cannot be represented as redistributable
+# PyPI dependencies.  These empty extras provide a stable installation and
+# support-matrix spelling while runtime discovery uses dedicated workers.
+isaacgym = []
+isaacsim = []
+
+[dependency-groups]
+# pyright is pinned to match the sister unilab-rl repository so both projects
+# type-check with the same analyzer behavior.
+dev = ["pytest", "ruff", "mypy", "pyright==1.1.408"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
+# mypy is configured exactly like the sister unilab-rl repository:
+# no_site_packages + ignore_missing_imports mean site-package stubs (NumPy
+# included) are never parsed, so the 3.10 target does not trip over the
+# locked NumPy stubs' 3.12 ``type`` statement, and the optional engine SDKs
+# (which ship no stubs or py.typed marker, or are not pip-installable at all)
+# need no per-module exemptions.  pyright below keeps NumPy fully typed.
+[tool.mypy]
+mypy_path = "src"
+explicit_package_bases = true
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+no_site_packages = true
+
+# pyright lives in pyproject.toml (rather than pyrightconfig.json) so all tool
+# configuration stays in one file, matching the unilab-rl setup.
+[tool.pyright]
+pythonVersion = "3.10"
+venvPath = "."
+venv = ".venv"
+include = ["src/unisim"]
+# Optional engine SDKs are extras (see the mypy note above); unresolved
+# optional-runtime imports are warnings, first-party type errors stay errors.
+reportMissingImports = "warning"
+reportMissingModuleSource = "none"
+# Unlike unilab-rl (whose checked deps are typed), unisim imports mujoco and
+# other SDKs that ship no py.typed marker; without this, pyright infers types
+# from their sources and reports hundreds of false attribute errors.  NumPy
+# carries py.typed and stays fully checked.
+useLibraryCodeForTypes = false

@@ -1,0 +1,15 @@
+# @package _global_
+defaults:
+  - /task/panthera_return/mujoco
+  - /task/panthera_horizontal/base
+  - _self_
+
+training:
+  task_name: PantheraHorizontalReturn
+
+algo:
+  experiment_name: panthera_horizontal_return
+  actor:
+    class_name: unilab.tasks.manipulation.table_tennis.horizontal_policy.ReferenceResidualModel
+    distribution_cfg:
+      init_std: 0.05

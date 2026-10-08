@@ -1,0 +1,37 @@
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+build/
+dist/
+
+# Local models, experiments and generated outputs.
+/artifacts/
+logs/
+runs/
+!runs/
+!runs/stage1/
+!runs/stage1/model_49.pt
+!runs/stage1/run_config.json
+!runs/stage1/run_summary.json
+*.log
+.DS_Store
+**/._*
+**/MUJOCO_LOG.TXT
+
+# Local credentials and editor state.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+.netrc
+.npmrc
+.pypirc
+.idea/
+.vscode/
+.codex/

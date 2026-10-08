@@ -1,0 +1,107 @@
+<mujoco model="Panthera table tennis scene">
+  <include file="panthera.xml"/>
+
+  <!-- Resolve the ball contact at 4 kHz; arm target updates remain at 100 Hz. -->
+  <option timestep="0.00025" integrator="implicitfast" gravity="0 0 -9.81"/>
+  <statistic center="0 0 0.7" extent="2.4"/>
+
+  <visual>
+    <headlight diffuse="0.7 0.7 0.7" ambient="0.25 0.25 0.25" specular="0.4 0.4 0.4"/>
+    <global azimuth="135" elevation="-25"/>
+  </visual>
+
+  <asset>
+    <texture name="skybox" type="skybox" builtin="gradient"
+      rgb1="0.35 0.45 0.60" rgb2="0.05 0.07 0.10" width="512" height="3072"/>
+    <texture name="ground_texture" type="2d" builtin="checker"
+      rgb1="0.30 0.30 0.32" rgb2="0.22 0.22 0.24" width="512" height="512"/>
+    <material name="ground_material" texture="ground_texture" texuniform="true" texrepeat="4 4"/>
+    <material name="table_material" rgba="0.08 0.18 0.65 1" specular="0.25" shininess="0.35"/>
+    <material name="line_material" rgba="0.95 0.95 0.95 1"/>
+    <material name="frame_material" rgba="0.16 0.17 0.19 1" metallic="0.4"/>
+    <material name="net_material" rgba="0.12 0.12 0.14 0.65"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 -1 4" dir="0 0 -1" directional="true" diffuse="0.8 0.8 0.8"/>
+    <geom name="floor" type="plane" size="5 5 0.05" material="ground_material"/>
+
+    <!-- Regulation table: 2.74 m x 1.525 m, playing surface at z=0.76 m. -->
+    <body name="table">
+      <geom name="table_top" type="box" pos="0 0 0.735" size="1.37 0.7625 0.025"
+        material="table_material" friction="0.35 0.005 0.0001"/>
+
+      <geom name="center_line" type="box" pos="0 0 0.761" size="1.37 0.01 0.001"
+        material="line_material" contype="0" conaffinity="0"/>
+      <geom name="edge_line_pos_y" type="box" pos="0 0.7525 0.761" size="1.37 0.01 0.001"
+        material="line_material" contype="0" conaffinity="0"/>
+      <geom name="edge_line_neg_y" type="box" pos="0 -0.7525 0.761" size="1.37 0.01 0.001"
+        material="line_material" contype="0" conaffinity="0"/>
+      <geom name="edge_line_pos_x" type="box" pos="1.36 0 0.761" size="0.01 0.7425 0.001"
+        material="line_material" contype="0" conaffinity="0"/>
+      <geom name="edge_line_neg_x" type="box" pos="-1.36 0 0.761" size="0.01 0.7425 0.001"
+        material="line_material" contype="0" conaffinity="0"/>
+
+      <geom name="table_leg_1" type="box" pos="1.05 0.58 0.355" size="0.04 0.04 0.355" material="frame_material"/>
+      <geom name="table_leg_2" type="box" pos="1.05 -0.58 0.355" size="0.04 0.04 0.355" material="frame_material"/>
+      <geom name="table_leg_3" type="box" pos="-1.05 0.58 0.355" size="0.04 0.04 0.355" material="frame_material"/>
+      <geom name="table_leg_4" type="box" pos="-1.05 -0.58 0.355" size="0.04 0.04 0.355" material="frame_material"/>
+    </body>
+
+    <!-- Regulation net height: 0.1525 m above the playing surface. -->
+    <body name="net">
+      <geom name="net_mesh" type="box" pos="0 0 0.83625" size="0.006 0.79 0.07625"
+        material="net_material"/>
+      <geom name="net_post_pos" type="cylinder" pos="0 0.79 0.83625" size="0.012 0.095"
+        material="frame_material"/>
+      <geom name="net_post_neg" type="cylinder" pos="0 -0.79 0.83625" size="0.012 0.095"
+        material="frame_material"/>
+    </body>
+
+    <!-- Rail is behind the short end; its Y axis matches a player's lateral movement. -->
+    <geom name="rail_beam" type="box" pos="-1.53 0 0.64" size="0.07 0.90 0.045"
+      material="frame_material"/>
+    <geom name="rail_support_pos" type="box" pos="-1.53 0.76 0.31" size="0.08 0.06 0.31"
+      material="frame_material"/>
+    <geom name="rail_support_neg" type="box" pos="-1.53 -0.76 0.31" size="0.08 0.06 0.31"
+      material="frame_material"/>
+
+    <body name="ball" pos="0.75 0 0.95">
+      <freejoint name="ball_free"/>
+      <geom name="ball_geom" type="sphere" size="0.02" mass="0.0027"
+        rgba="1 0.55 0.08 1" friction="0.20 0.005 0.0001" solref="0.01 1"/>
+    </body>
+  </worldbody>
+
+  <!-- Calibrated against the ITTF 300 mm drop / 230 to 260 mm rebound test.
+       A predefined pair isolates table restitution from paddle contacts. -->
+  <contact>
+    <pair name="ball_table_contact" geom1="ball_geom" geom2="table_top"
+      condim="3" friction="0.20 0.20 0.005 0.0001 0.0001"
+      solref="-400000 -44.271887242357316" solimp="0.9999 0.9999 0.001 0.5 2"/>
+  </contact>
+
+  <!-- Keep the rail fixed during the first arm-only training stage. -->
+  <equality>
+    <joint name="rail_lock" joint1="rail_joint" polycoef="0 0 0 0 0"/>
+    <!-- Joint5 is unused: retain the joint/actuator mapping but constrain it to zero. -->
+    <joint name="joint5_lock" joint1="joint5" polycoef="0 0 0 0 0"
+      solref="0.004 1" solimp="0.9999 0.9999 0.001"/>
+  </equality>
+
+  <!-- Provisional rail drive. The default scene remains rail-locked;
+       only the explicit lateral-alignment preview releases rail_lock. -->
+  <actuator>
+    <motor name="rail_force" joint="rail_joint" gear="1"
+      ctrllimited="true" ctrlrange="-100 100"
+      forcelimited="true" forcerange="-100 100"/>
+  </actuator>
+
+  <keyframe>
+    <key name="home"
+      qpos="0.0
+            0.0 0.3 0.3 0.0 0.0 1.5
+            0.75 0 0.95 1 0 0 0"
+      ctrl="0.0 0.3 0.3 0.0 0.0 1.5 0.0"/>
+  </keyframe>
+</mujoco>

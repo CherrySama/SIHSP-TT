@@ -1,0 +1,35 @@
+# @package _global_
+defaults:
+  - /task/panthera_return/base
+  - _self_
+
+training:
+  task_name: PantheraReturn
+  init_at_random_ep_len: false
+  sim_backend: mujoco
+  device: cpu
+  no_play: true
+  play_env_num: 1
+
+algo:
+  seed: 7
+  num_envs: 32
+  num_steps_per_env: 64
+  max_iterations: 1001
+  save_interval: 50
+  experiment_name: panthera_return
+  actor:
+    hidden_dims: [128, 128]
+    obs_normalization: true
+    distribution_cfg:
+      init_std: 0.6
+  critic:
+    hidden_dims: [128, 128]
+    obs_normalization: true
+  algorithm:
+    learning_rate: 0.0003
+    num_learning_epochs: 5
+    num_mini_batches: 4
+    gamma: 0.995
+    lam: 0.95
+    entropy_coef: 0.01

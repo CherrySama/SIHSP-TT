@@ -1,0 +1,52 @@
+# @package _global_
+# Explicit profiles derived from measured native-contact witnesses. They are
+# embedded in the policy contract, with no dependency on artifact files.
+env:
+  observations:
+    policy:
+      terms:
+        return_state:
+          func: unilab.tasks.manipulation.table_tennis.horizontal_return.horizontal_observation
+  actions:
+    return_control:
+      _target_: unilab.tasks.manipulation.table_tennis.horizontal_return.HorizontalReturnActionCfg
+      stroke_mode: hermite
+      preparation_reach: 0.74
+      reference_speed_fraction: 0.98
+      preparation_position_gain: 100.0
+      preparation_side_deadband: 0.005
+      right_stroke: [0.22745269177501676, 0.11708569332581586, 4.116, -0.3883316786975143, 2.9779083225880543, -3.7910165797456505, 0.20389484935300728, 0.34704219797818325, -0.046995586011231896, 0.17263929345218265, 0.03252748905928883, -0.049418363140915224, 0.14086507399377324]
+      left_stroke: [0.22745269177501676, 0.11708569332581586, 4.116, -0.3883316786975143, 2.9779083225880543, -3.7910165797456505, 0.3704875029428004, 0.34704219797818325, -0.046995586011231896, 0.17263929345218265, 0.03252748905928883, -0.049418363140915224, 0.14086507399377324]
+      clock_max_rate: 1.02
+      clock_acceleration: 5.0
+      yaw_residual: 0.015
+      arm_residual: 0.015
+      tilt_residual: 0.03
+      residual_velocity: 0.15
+      residual_acceleration: 2.0
+  metrics:
+    horizontal_legal:
+      _target_: unilab.managers.MetricsTermCfg
+      func: unilab.tasks.manipulation.table_tennis.horizontal_return.horizontal_metric
+      reduce: last
+
+# Inherit true-event and incoming/outgoing predictive terms from PantheraReturn.
+# Costs apply only to policy corrections, never to the entire nominal stroke.
+reward:
+  adjustment_cost:
+    func: unilab.tasks.manipulation.table_tennis.horizontal_return.horizontal_cost
+    weight: -0.02
+    params: {component: residual}
+  acceleration_cost:
+    func: unilab.tasks.manipulation.table_tennis.horizontal_return.horizontal_cost
+    weight: -0.01
+    params: {component: smoothness}
+  horizontal_form:
+    _target_: unilab.managers.RewardTermCfg
+    func: unilab.tasks.manipulation.table_tennis.horizontal_return.horizontal_cost
+    weight: -0.5
+    params: {component: form}
+  horizontal_quality:
+    _target_: unilab.managers.RewardTermCfg
+    func: unilab.tasks.manipulation.table_tennis.horizontal_return.horizontal_quality
+    weight: 2.0

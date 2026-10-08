@@ -1,0 +1,637 @@
+{
+  "run": {
+    "algo": "ppo",
+    "task": "PantheraHorizontalReturn",
+    "sim_backend": "mujoco",
+    "device": "cpu",
+    "collector_device": null,
+    "log_dir": "../artifacts/return_horizontal_random_20261007/ppo_reference_init",
+    "start_time_utc": "2026-10-07T07:06:49.234972+00:00",
+    "hostname": "Mikes-MacBook-Pro.local",
+    "user": "mikeho",
+    "git": {
+      "commit": "3f1c4150b930e9f7ca0f3e2ec6f076a6ebba77b1",
+      "branch": "main",
+      "dirty": true
+    },
+    "hardware": {
+      "platform": "macOS-27.0.1-arm64-arm-64bit",
+      "chip": "Apple M5 Max",
+      "cpu_total_cores": "18",
+      "cpu_performance_cores": "unknown",
+      "cpu_efficiency_cores": "unknown",
+      "gpu_cores": "32",
+      "memory": "36 GB",
+      "cpu_core_type_1": "Super",
+      "cpu_core_count_1": "6",
+      "cpu_core_type_2": "Performance",
+      "cpu_core_count_2": "12"
+    },
+    "wandb": {
+      "project": "unilab",
+      "entity": null,
+      "name": "ppo__PantheraHorizontalReturn__ppo_reference_init",
+      "group": "PantheraHorizontalReturn",
+      "job_type": "ppo",
+      "tags": [
+        "ppo",
+        "PantheraHorizontalReturn",
+        "mujoco",
+        "user-mikeho"
+      ],
+      "notes": null,
+      "mode": null
+    },
+    "configured_seed": 7,
+    "configured_seed_source": "algo.seed",
+    "effective_seed": 7
+  },
+  "config": {
+    "algo": {
+      "algo": "ppo",
+      "algo_log_name": "rsl_rl_ppo",
+      "seed": 7,
+      "num_envs": 16,
+      "num_steps_per_env": 64,
+      "max_iterations": 50,
+      "save_interval": 10,
+      "obs_groups": {
+        "actor": [
+          "policy"
+        ]
+      },
+      "experiment_name": "panthera_horizontal_return",
+      "run_name": "",
+      "resume": false,
+      "load_run": "-1",
+      "checkpoint": -1,
+      "resume_path": null,
+      "actor": {
+        "class_name": "unilab.tasks.manipulation.table_tennis.horizontal_policy.ReferenceResidualModel",
+        "hidden_dims": [
+          128,
+          128
+        ],
+        "activation": "elu",
+        "obs_normalization": true,
+        "distribution_cfg": {
+          "class_name": "rsl_rl.modules.distribution.GaussianDistribution",
+          "init_std": 0.05,
+          "std_type": "scalar"
+        }
+      },
+      "critic": {
+        "class_name": "rsl_rl.models.MLPModel",
+        "hidden_dims": [
+          128,
+          128
+        ],
+        "activation": "elu",
+        "obs_normalization": true
+      },
+      "algorithm": {
+        "class_name": "rsl_rl.algorithms:PPO",
+        "value_loss_coef": 1.0,
+        "use_clipped_value_loss": true,
+        "clip_param": 0.2,
+        "entropy_coef": 0.01,
+        "num_learning_epochs": 5,
+        "num_mini_batches": 4,
+        "learning_rate": 0.0003,
+        "schedule": "adaptive",
+        "gamma": 0.995,
+        "lam": 0.95,
+        "desired_kl": 0.01,
+        "max_grad_norm": 1.0
+      }
+    },
+    "training": {
+      "task_name": "PantheraHorizontalReturn",
+      "init_at_random_ep_len": false,
+      "devices": null,
+      "dp_collector_cpu_ids": null,
+      "device": "cpu",
+      "logger": "tensorboard",
+      "wandb_project": "unilab",
+      "wandb_entity": null,
+      "wandb_group": null,
+      "wandb_job_type": null,
+      "wandb_name": null,
+      "wandb_tags": [],
+      "wandb_notes": null,
+      "wandb_mode": null,
+      "sim_backend": "mujoco",
+      "nan_guard": {
+        "enabled": true,
+        "buffer_size": 100,
+        "max_envs_to_dump": 5,
+        "output_dir": null
+      },
+      "play_only": false,
+      "no_play": true,
+      "sim2sim_strict": true,
+      "play_render_mode": "auto",
+      "play_env_num": 1,
+      "render_spacing": 1.0,
+      "play_steps": 200,
+      "cam_distance": 6.0,
+      "cam_elevation": -20.0,
+      "cam_azimuth": 90.0,
+      "cam_lookat": null,
+      "cam_tracking": false,
+      "cam_tracking_env_idx": 0,
+      "cam_tracking_extra_envs": 2,
+      "log_root": null,
+      "num_timesteps": null,
+      "log_dir": "../artifacts/return_horizontal_random_20261007/ppo_reference_init"
+    },
+    "interactive": {
+      "action_mode": "zero",
+      "policy_obs_mode": "auto",
+      "show_target_bodies": false,
+      "show_reward_debug": false,
+      "target_show_axes": false,
+      "target_body_names": "",
+      "target_max_bodies": 0,
+      "target_marker_radius": 0.02,
+      "target_axis_length": 0.08,
+      "target_marker_alpha": 0.75,
+      "reward_debug_show_velocity": false,
+      "reward_debug_lin_vel_scale": 0.08,
+      "reward_debug_ang_vel_scale": 0.05,
+      "reward_debug_show_connectors": false,
+      "reward_debug_show_global_anchor": false,
+      "camera_follow_body": true,
+      "camera_focus_body_name": "",
+      "camera_height_offset": 0.15,
+      "camera_distance": null,
+      "camera_elevation": null,
+      "camera_azimuth": null,
+      "use_env_visual_model": true,
+      "speed": 1.0,
+      "start_paused": false,
+      "keyboard": false,
+      "keyboard_step_lin": 0.1,
+      "keyboard_step_ang": 0.2
+    },
+    "viser": {
+      "port": 8080,
+      "env_idx": 0,
+      "display_mode": "all",
+      "max_envs": 16
+    },
+    "env": {
+      "scene": {
+        "default_keyframe_name": "home",
+        "entities": {
+          "robot": {
+            "root_body_name": "rail_carriage",
+            "joint_names": [
+              "rail_joint",
+              "joint1",
+              "joint2",
+              "joint3",
+              "joint4",
+              "joint6"
+            ],
+            "body_names": [
+              "rail_carriage",
+              "paddle_frame",
+              "link6"
+            ],
+            "geom_names": [
+              "paddle_contact"
+            ],
+            "actuator_names": [
+              "rail_force",
+              "joint1_position",
+              "joint2_position",
+              "joint3_position",
+              "joint4_position",
+              "joint6_position"
+            ]
+          },
+          "ball": {
+            "root_body_name": "ball",
+            "body_names": [
+              "ball"
+            ],
+            "geom_names": [
+              "ball_geom"
+            ]
+          }
+        }
+      },
+      "sim_dt": 0.00025,
+      "ctrl_dt": 0.01,
+      "max_episode_seconds": 4.0,
+      "seed": 7,
+      "auto_reset": true,
+      "scale_rewards_by_dt": false,
+      "observations": {
+        "policy": {
+          "_target_": "unilab.managers.ObservationGroupCfg",
+          "terms": {
+            "return_state": {
+              "func": "unilab.tasks.manipulation.table_tennis.horizontal_return.horizontal_observation"
+            },
+            "ball_history": {
+              "func": "unilab.tasks.manipulation.table_tennis.return_control.return_ball_history",
+              "history_length": 5
+            }
+          }
+        }
+      },
+      "actions": {
+        "return_control": {
+          "_target_": "unilab.tasks.manipulation.table_tennis.horizontal_return.HorizontalReturnActionCfg",
+          "entity_name": "robot",
+          "yaw_velocity": 3.0,
+          "tilt_velocity": 3.0,
+          "yaw_acceleration": 12.0,
+          "tilt_acceleration": 20.0,
+          "residual_control": true,
+          "rail_offset": 0.03,
+          "arm_offset": 0.03,
+          "rail_adjustment_velocity": 0.2,
+          "rail_adjustment_acceleration": 2.0,
+          "arm_adjustment_velocity": 0.5,
+          "arm_adjustment_acceleration": 4.0,
+          "handoff_duration": 0.05,
+          "guidance": {
+            "_target_": "unilab.tasks.manipulation.table_tennis.return_guidance.ReturnGuidanceCfg",
+            "gravity": 9.81,
+            "horizon": 0.5,
+            "sample_dt": 0.01,
+            "freshness": 0.05,
+            "tolerance": 0.02,
+            "distance_scale": 0.06,
+            "fade_far": 0.16,
+            "fade_near": 0.06,
+            "strike_far": 0.2,
+            "strike_near": 0.1,
+            "velocity_scale": 0.8,
+            "paddle_radius": 0.07,
+            "paddle_half_thickness": 0.00725,
+            "ball_radius": 0.02
+          },
+          "stroke_mode": "hermite",
+          "preparation_reach": 0.74,
+          "reference_speed_fraction": 0.98,
+          "preparation_position_gain": 100.0,
+          "preparation_side_deadband": 0.005,
+          "right_stroke": [
+            0.22745269177501676,
+            0.11708569332581586,
+            4.116,
+            -0.3883316786975143,
+            2.9779083225880543,
+            -3.7910165797456505,
+            0.20389484935300728,
+            0.34704219797818325,
+            -0.046995586011231896,
+            0.17263929345218265,
+            0.03252748905928883,
+            -0.049418363140915224,
+            0.14086507399377324
+          ],
+          "left_stroke": [
+            0.22745269177501676,
+            0.11708569332581586,
+            4.116,
+            -0.3883316786975143,
+            2.9779083225880543,
+            -3.7910165797456505,
+            0.3704875029428004,
+            0.34704219797818325,
+            -0.046995586011231896,
+            0.17263929345218265,
+            0.03252748905928883,
+            -0.049418363140915224,
+            0.14086507399377324
+          ],
+          "clock_max_rate": 1.02,
+          "clock_acceleration": 5.0,
+          "yaw_residual": 0.015,
+          "arm_residual": 0.015,
+          "tilt_residual": 0.03,
+          "residual_velocity": 0.15,
+          "residual_acceleration": 2.0
+        }
+      },
+      "events": {
+        "reset_scene_to_default": {
+          "_target_": "unilab.managers.EventTermCfg",
+          "func": "unilab.envs.mdp.reset_scene_to_default",
+          "mode": "reset"
+        },
+        "launch_ball": {
+          "_target_": "unilab.managers.EventTermCfg",
+          "func": "unilab.tasks.manipulation.table_tennis.ball_launcher.launch_random_ball",
+          "mode": "reset",
+          "params": {
+            "launcher_cfg": {
+              "_target_": "unilab.tasks.manipulation.table_tennis.ball_launcher.ServeLauncherCfg"
+            },
+            "asset_cfg": {
+              "_target_": "unilab.managers.SceneEntityCfg",
+              "name": "ball"
+            }
+          }
+        }
+      },
+      "terminations": {
+        "return_result": {
+          "_target_": "unilab.managers.TerminationTermCfg",
+          "func": "unilab.tasks.manipulation.table_tennis.return_control.return_done"
+        },
+        "time_out": {
+          "_target_": "unilab.managers.TerminationTermCfg",
+          "func": "unilab.envs.mdp.time_out",
+          "time_out": true
+        }
+      },
+      "metrics": {
+        "success": {
+          "_target_": "unilab.managers.MetricsTermCfg",
+          "func": "unilab.tasks.manipulation.table_tennis.return_control.return_metric",
+          "params": {
+            "condition": "success"
+          },
+          "reduce": "last"
+        },
+        "hit": {
+          "_target_": "unilab.managers.MetricsTermCfg",
+          "func": "unilab.tasks.manipulation.table_tennis.return_control.return_metric",
+          "params": {
+            "condition": "hit"
+          },
+          "reduce": "last"
+        },
+        "crossed_net": {
+          "_target_": "unilab.managers.MetricsTermCfg",
+          "func": "unilab.tasks.manipulation.table_tennis.return_control.return_metric",
+          "params": {
+            "condition": "crossed_net"
+          },
+          "reduce": "last"
+        },
+        "preparation_failed": {
+          "_target_": "unilab.managers.MetricsTermCfg",
+          "func": "unilab.tasks.manipulation.table_tennis.return_control.return_metric",
+          "params": {
+            "condition": "preparation_failed"
+          },
+          "reduce": "last"
+        },
+        "horizontal_legal": {
+          "_target_": "unilab.managers.MetricsTermCfg",
+          "func": "unilab.tasks.manipulation.table_tennis.horizontal_return.horizontal_metric",
+          "reduce": "last"
+        }
+      },
+      "policy_observation_group": "policy",
+      "critic_observation_group": null
+    },
+    "reward": {
+      "first_hit": {
+        "_target_": "unilab.managers.RewardTermCfg",
+        "func": "unilab.tasks.manipulation.table_tennis.return_control.return_reward",
+        "weight": 0.1,
+        "params": {
+          "event": "hit"
+        }
+      },
+      "crossed_net": {
+        "_target_": "unilab.managers.RewardTermCfg",
+        "func": "unilab.tasks.manipulation.table_tennis.return_control.return_reward",
+        "weight": 0.5,
+        "params": {
+          "event": "crossed_net"
+        }
+      },
+      "success": {
+        "_target_": "unilab.managers.RewardTermCfg",
+        "func": "unilab.tasks.manipulation.table_tennis.return_control.return_reward",
+        "weight": 10.0,
+        "params": {
+          "event": "success"
+        }
+      },
+      "failure": {
+        "_target_": "unilab.managers.RewardTermCfg",
+        "func": "unilab.tasks.manipulation.table_tennis.return_control.return_reward",
+        "weight": -5.0,
+        "params": {
+          "event": "failure"
+        }
+      },
+      "adjustment_cost": {
+        "_target_": "unilab.managers.RewardTermCfg",
+        "func": "unilab.tasks.manipulation.table_tennis.horizontal_return.horizontal_cost",
+        "weight": -0.02,
+        "params": {
+          "component": "residual"
+        }
+      },
+      "acceleration_cost": {
+        "_target_": "unilab.managers.RewardTermCfg",
+        "func": "unilab.tasks.manipulation.table_tennis.horizontal_return.horizontal_cost",
+        "weight": -0.01,
+        "params": {
+          "component": "smoothness"
+        }
+      },
+      "reaching": {
+        "_target_": "unilab.managers.RewardTermCfg",
+        "func": "unilab.tasks.manipulation.table_tennis.return_control.return_guidance_reward",
+        "weight": 0.3,
+        "params": {
+          "component": "reach"
+        }
+      },
+      "striking": {
+        "_target_": "unilab.managers.RewardTermCfg",
+        "func": "unilab.tasks.manipulation.table_tennis.return_control.return_guidance_reward",
+        "weight": 0.2,
+        "params": {
+          "component": "strike"
+        }
+      },
+      "outgoing_direction": {
+        "_target_": "unilab.managers.RewardTermCfg",
+        "func": "unilab.tasks.manipulation.table_tennis.return_control.return_shaping_reward",
+        "weight": 0.2,
+        "params": {
+          "component": "direction",
+          "shaping_cfg": {
+            "_target_": "unilab.tasks.manipulation.table_tennis.return_shaping.ReturnShapingCfg",
+            "gravity": 9.81,
+            "forward_speed": 3.0,
+            "net_clearance": 0.08,
+            "net_height_scale": 0.18,
+            "landing_x_scale": 0.75,
+            "landing_y_scale": 0.25
+          }
+        }
+      },
+      "predicted_net_height": {
+        "_target_": "unilab.managers.RewardTermCfg",
+        "func": "unilab.tasks.manipulation.table_tennis.return_control.return_shaping_reward",
+        "weight": 0.5,
+        "params": {
+          "component": "net_height",
+          "shaping_cfg": {
+            "_target_": "unilab.tasks.manipulation.table_tennis.return_shaping.ReturnShapingCfg",
+            "gravity": 9.81,
+            "forward_speed": 3.0,
+            "net_clearance": 0.08,
+            "net_height_scale": 0.18,
+            "landing_x_scale": 0.75,
+            "landing_y_scale": 0.25
+          }
+        }
+      },
+      "predicted_landing": {
+        "_target_": "unilab.managers.RewardTermCfg",
+        "func": "unilab.tasks.manipulation.table_tennis.return_control.return_shaping_reward",
+        "weight": 1.3,
+        "params": {
+          "component": "landing",
+          "shaping_cfg": {
+            "_target_": "unilab.tasks.manipulation.table_tennis.return_shaping.ReturnShapingCfg",
+            "gravity": 9.81,
+            "forward_speed": 3.0,
+            "net_clearance": 0.08,
+            "net_height_scale": 0.18,
+            "landing_x_scale": 0.75,
+            "landing_y_scale": 0.25
+          }
+        }
+      },
+      "horizontal_form": {
+        "_target_": "unilab.managers.RewardTermCfg",
+        "func": "unilab.tasks.manipulation.table_tennis.horizontal_return.horizontal_cost",
+        "weight": -0.5,
+        "params": {
+          "component": "form"
+        }
+      },
+      "horizontal_quality": {
+        "_target_": "unilab.managers.RewardTermCfg",
+        "func": "unilab.tasks.manipulation.table_tennis.horizontal_return.horizontal_quality",
+        "weight": 2.0
+      }
+    }
+  },
+  "contract_snapshot": {
+    "algo.obs_groups": {
+      "actor": [
+        "policy"
+      ]
+    },
+    "env.observations": {
+      "policy": {
+        "_target_": "unilab.managers.ObservationGroupCfg",
+        "terms": {
+          "return_state": {
+            "func": "unilab.tasks.manipulation.table_tennis.horizontal_return.horizontal_observation"
+          },
+          "ball_history": {
+            "func": "unilab.tasks.manipulation.table_tennis.return_control.return_ball_history",
+            "history_length": 5
+          }
+        }
+      }
+    },
+    "env.actions": {
+      "return_control": {
+        "_target_": "unilab.tasks.manipulation.table_tennis.horizontal_return.HorizontalReturnActionCfg",
+        "entity_name": "robot",
+        "yaw_velocity": 3.0,
+        "tilt_velocity": 3.0,
+        "yaw_acceleration": 12.0,
+        "tilt_acceleration": 20.0,
+        "residual_control": true,
+        "rail_offset": 0.03,
+        "arm_offset": 0.03,
+        "rail_adjustment_velocity": 0.2,
+        "rail_adjustment_acceleration": 2.0,
+        "arm_adjustment_velocity": 0.5,
+        "arm_adjustment_acceleration": 4.0,
+        "handoff_duration": 0.05,
+        "guidance": {
+          "_target_": "unilab.tasks.manipulation.table_tennis.return_guidance.ReturnGuidanceCfg",
+          "gravity": 9.81,
+          "horizon": 0.5,
+          "sample_dt": 0.01,
+          "freshness": 0.05,
+          "tolerance": 0.02,
+          "distance_scale": 0.06,
+          "fade_far": 0.16,
+          "fade_near": 0.06,
+          "strike_far": 0.2,
+          "strike_near": 0.1,
+          "velocity_scale": 0.8,
+          "paddle_radius": 0.07,
+          "paddle_half_thickness": 0.00725,
+          "ball_radius": 0.02
+        },
+        "stroke_mode": "hermite",
+        "preparation_reach": 0.74,
+        "reference_speed_fraction": 0.98,
+        "preparation_position_gain": 100.0,
+        "preparation_side_deadband": 0.005,
+        "right_stroke": [
+          0.22745269177501676,
+          0.11708569332581586,
+          4.116,
+          -0.3883316786975143,
+          2.9779083225880543,
+          -3.7910165797456505,
+          0.20389484935300728,
+          0.34704219797818325,
+          -0.046995586011231896,
+          0.17263929345218265,
+          0.03252748905928883,
+          -0.049418363140915224,
+          0.14086507399377324
+        ],
+        "left_stroke": [
+          0.22745269177501676,
+          0.11708569332581586,
+          4.116,
+          -0.3883316786975143,
+          2.9779083225880543,
+          -3.7910165797456505,
+          0.3704875029428004,
+          0.34704219797818325,
+          -0.046995586011231896,
+          0.17263929345218265,
+          0.03252748905928883,
+          -0.049418363140915224,
+          0.14086507399377324
+        ],
+        "clock_max_rate": 1.02,
+        "clock_acceleration": 5.0,
+        "yaw_residual": 0.015,
+        "arm_residual": 0.015,
+        "tilt_residual": 0.03,
+        "residual_velocity": 0.15,
+        "residual_acceleration": 2.0
+      }
+    },
+    "env.policy_observation_group": "policy",
+    "algo.actor.hidden_dims": [
+      128,
+      128
+    ],
+    "algo.critic.hidden_dims": [
+      128,
+      128
+    ],
+    "algo.actor.obs_normalization": true,
+    "algo.critic.obs_normalization": true,
+    "env.ctrl_dt": 0.01
+  }
+}

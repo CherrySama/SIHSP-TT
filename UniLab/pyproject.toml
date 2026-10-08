@@ -1,0 +1,204 @@
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+# Downloaded robot meshes stay out of the wheel; keep in sync with
+# ROBOT_ASSET_SPECS in src/unilab/assets/hub.py.
+source-exclude = [
+    "/src/unilab/assets/bots",
+    "/src/unilab/assets/robots/allegro_hand/assets",
+    "/src/unilab/assets/robots/g1/assets",
+    "/src/unilab/assets/robots/g1/textures",
+    "/src/unilab/assets/robots/go2/assets",
+    "/src/unilab/assets/robots/x2/meshes",
+]
+
+[project]
+name = "unilab"
+version = "1.3.2"
+description = "Configurable, contract-driven robot learning across physics backends"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "UniLab Authors" }]
+keywords = ["robot-learning", "reinforcement-learning", "mujoco", "simulation"]
+classifiers = [
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "numpy",
+    "unisim-core>=1.7.5",
+    "numba>=0.67",
+    "prettytable>=3.10",
+    # A range (not an exact pin) lets ROCm users substitute a ROCm torch
+    # build; uv.lock pins the tested CUDA builds via tool.uv.sources.
+    "torch>=2.9,<2.12 ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "torch>=2.8,<2.12 ; sys_platform != 'linux' or platform_machine != 'aarch64'",
+    "gymnasium",
+    "imageio",
+    "etils",
+    "hydra-core>=1.3",
+    "tensordict",
+    "rsl-rl-lib>=5.0.0",
+    "packaging",
+    "mediapy",
+    "tensorboard>=2.21.0",
+    "setuptools",
+    "rich",
+    "tqdm",
+    "typing-extensions",
+    "lark>=1.3.1",
+    "wandb",
+    "onnxruntime<1.20 ; python_version < '3.11'",
+    "onnxruntime>=1.20 ; python_version >= '3.11'",
+    "huggingface_hub>=0.25",
+    "ninja ; sys_platform == 'linux'",
+    "imageio-ffmpeg>=0.6.0",
+    "viser>=1.0.26",
+    "trimesh>=3.21.7",
+]
+
+[project.scripts]
+train = "unilab.cli:train_main"
+eval = "unilab.cli:eval_main"
+demo = "unilab.cli:demo_main"
+unilab-complete = "unilab.cli_completion:main"
+unilab-viz-nan = "unilab.utils.nan_viz:main"
+unilab-render-teaser = "unilab.visualization.teaser:main"
+unilab-pull-assets = "unilab.assets.pull:main"
+
+[project.urls]
+Homepage = "https://unilabsim.github.io"
+Documentation = "https://unilabsim.github.io/UniLab-doc/"
+Repository = "https://github.com/unilabsim/UniLab"
+Issues = "https://github.com/unilabsim/UniLab/issues"
+
+[project.optional-dependencies]
+# Drake C++ is an external toolchain; the native extension is built against
+# the local DRAKE_HOME after sync. mujoco provides the playback renderer.
+drake = [
+    "drake-uni==0.1.0",
+    "mujoco>=3.5",
+]
+# mjbatch is built and version-checked against mujoco==3.11.0; switching
+# MuJoCo versions requires an mjbatch rebuild.
+mujoco = [
+    "mujoco~=3.11.0",
+    "mjbatch-uni~=0.2.4",
+]
+# Shares the MuJoCo 3.11 / warp-lang 1.16 line with the mujoco/newton extras.
+mjwarp = [
+    "mujoco-warp~=3.11.0",
+    "warp-lang==1.16.0",
+]
+newton = [
+    "newton==1.5.1",
+    "mujoco-warp==3.11.0",
+    "mujoco==3.11.0",
+    "warp-lang==1.16.0",
+    # ViewerGL playback renderer GUI stack.
+    "pyglet>=2.1.6,<3",
+    "imgui-bundle>=1.92.0",
+]
+motrix = ["unisim-core[motrix]>=1.7.5"]
+genesis = ["genesis-world==1.3.3"]
+uni_rl = ["unilab-rl==1.3.2"]
+# Wheels are CPython 3.12/3.13 Linux x86_64 only; the marker keeps uv lock
+# resolvable for the other required-environments.
+superdex = [
+    "unisim-core[superdex]>=1.7.5 ; python_version >= '3.12' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+[dependency-groups]
+# Dev/CI exercises the APPO/off-policy/multi-GPU paths, so the optional
+# unilab-rl runtime stays installed in the dev environment.
+dev = ["pytest", "pytest-cov", "ruff", "mypy", "pyright>=1.1.408", "unilab-rl==1.3.2"]
+table-tennis = ["sihsp-tt-core"]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "r2-cu130"
+url = "https://download-r2.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+sihsp-tt-core = { path = "..", editable = true }
+unisim-core = { path = "../UniSim", editable = true }
+torch = [
+    { index = "r2-cu130", marker = "sys_platform=='linux' and platform_machine=='aarch64'" },
+    { index = "pytorch-cu128", marker = "sys_platform=='linux' and platform_machine=='x86_64'" },
+    { index = "pytorch-cu128", marker = "sys_platform=='win32'" },
+]
+
+[tool.uv]
+exclude-dependencies = ["torchvision"]
+required-environments = [
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src"]
+extend-exclude = [".history"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+ignore = [
+    "E501",
+    "N806",
+    "E402",
+    "F401",
+    "N801",
+    "F821",
+    "E741",
+    "N802",
+    "N803",
+    "N812",
+]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+no_site_packages = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: long-running training or script smoke tests, or cumulatively expensive backend matrices",
+]
+addopts = "--tb=short -m 'not slow'"
+
+[tool.coverage.run]
+source = ["src/unilab"]
+
+[tool.coverage.report]
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:"]
+
+[tool.pyright]
+pythonVersion = "3.10"
+venvPath = "."
+venv = ".venv"
+include = ["src/unilab"]
+exclude = [
+    "src/unilab/envs/",                     # lazy optional `mujoco` import; not installed in the pyright env
+    "src/unilab/visualization/",            # direct mujoco C bindings; not installed in the pyright env
+]
+reportMissingImports = "warning"
+reportMissingModuleSource = "none"
