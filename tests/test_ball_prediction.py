@@ -174,6 +174,26 @@ def test_service_events_are_ordered_and_history_is_receiver_specific():
     assert predict_ball(state, cfg, has_bounced=True).reason == "inconsistent_bounce_history"
 
 
+def test_opponent_bounce_apex_is_after_the_opponent_half_impact():
+    from unilab.tasks.manipulation.table_tennis.prediction_adapter import opponent_bounce_apex
+
+    state, cfg = _service()
+    result = predict_ball(state, cfg)
+    assert result.opponent_bounce is not None
+    apex = opponent_bounce_apex(result, cfg)
+    assert apex is not None
+    rebound_vz = -cfg.normal_restitution * result.opponent_bounce.velocity[2]
+    expected_time = (
+        result.opponent_bounce.timestamp
+        + cfg.opponent_contact_duration
+        + rebound_vz / cfg.gravity
+    )
+    assert apex.timestamp == pytest.approx(expected_time)
+    assert apex.velocity[2] == pytest.approx(0.0)
+    assert apex.position[0] < result.opponent_bounce.position[0]
+    assert apex.position[2] > cfg.table_z + cfg.ball_radius
+
+
 def test_service_latency_uses_each_flight_and_rejects_contact_interval():
     state, cfg = _service()
     result = predict_ball(state, cfg)

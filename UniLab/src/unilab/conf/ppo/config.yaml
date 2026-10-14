@@ -19,6 +19,9 @@ algo:
   load_run: "-1"
   checkpoint: -1
   resume_path: null
+  # Experimental warm-starts that change the actor contract can discard the
+  # old optimizer slots and iteration counter while retaining model weights.
+  warmstart_reset_optimizer: false
   actor:
     class_name: rsl_rl.models.MLPModel
     hidden_dims: [512, 256, 128]
@@ -121,6 +124,9 @@ interactive:
   keyboard: false
   keyboard_step_lin: 0.1
   keyboard_step_ang: 0.2
+  terminal_reset_mode: immediate
+  terminal_endline_x: 1.37
+  terminal_hold_max_steps: 300
 
 viser:
   port: 8080

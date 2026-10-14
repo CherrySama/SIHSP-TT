@@ -10,7 +10,10 @@ pytest.importorskip("mujoco")
 
 from unilab.envs.manager_based_rl_env import make_manager_based_rl_env
 from unilab.tasks.manipulation.table_tennis.ball_launcher import ServeLauncherCfg
-from unilab.tasks.manipulation.table_tennis.training import build_panthera_return_env_cfg
+from unilab.tasks.manipulation.table_tennis.training import (
+    build_panthera_horizontal_env_cfg,
+    build_panthera_return_env_cfg,
+)
 
 
 @pytest.fixture(params=[-0.35, 0.35])

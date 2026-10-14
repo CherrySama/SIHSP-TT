@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -79,8 +80,23 @@ class RslRlVecEnvAdapter:
 
         self.episode_returns = torch.zeros(self.num_envs, device=device)
         self.episode_lengths = torch.zeros(self.num_envs, device=device)
+        self._before_step_hook: Callable[[], None] | None = None
+        self._after_step_hook: Callable[[torch.Tensor], None] | None = None
+        self._reset_hook: Callable[[], None] | None = None
         self.max_episode_length = np.ceil(env.cfg.max_episode_seconds / env.cfg.ctrl_dt)
         self.reset()
+
+    def register_step_hooks(
+        self,
+        *,
+        before_step: Callable[[], None] | None = None,
+        after_step: Callable[[torch.Tensor], None] | None = None,
+        on_reset: Callable[[], None] | None = None,
+    ) -> None:
+        """Install an optional task-owned hook around each environment step."""
+        self._before_step_hook = before_step
+        self._after_step_hook = after_step
+        self._reset_hook = on_reset
 
     @property
     def episode_length_buf(self) -> torch.Tensor:
@@ -126,10 +142,15 @@ class RslRlVecEnvAdapter:
     def step(
         self, actions: torch.Tensor | np.ndarray
     ) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
+        if self._before_step_hook is not None:
+            self._before_step_hook()
         actions_np = _to_numpy(actions)
         state = self.env.step(actions_np)
         rewards = _to_torch(state.reward, self.device)
         dones = _to_torch(state.terminated | state.truncated, self.device).bool()
+
+        if self._after_step_hook is not None:
+            self._after_step_hook(dones)
 
         self.episode_returns += rewards
         self.episode_lengths += 1
@@ -154,6 +175,8 @@ class RslRlVecEnvAdapter:
         obs_out, info = self.env.reset(env_indices)
         self.episode_returns[:] = 0
         self.episode_lengths[:] = 0
+        if self._reset_hook is not None:
+            self._reset_hook()
         return self._obs_to_tensordict(obs_out), info
 
     def get_observations(self) -> TensorDict:

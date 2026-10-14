@@ -72,6 +72,7 @@ EXPORT_POLICY = False
 
 try:
     from rsl_rl.runners import OnPolicyRunner
+    from rsl_rl.utils import resolve_callable
 except ImportError:
     print("Could not import rsl_rl. Please ensure it is installed.")
     sys.exit(1)
@@ -84,6 +85,17 @@ def _backend_adapter(cfg: DictConfig) -> BackendAdapter:
         algo_name="ppo",
         scene_materializer=materialize_scene_visual_override,
     )
+
+
+def _resolve_runner_class(cfg: DictConfig):
+    """Resolve an optional task-owned runner while keeping PPO default-only."""
+    name = OmegaConf.select(cfg, "algo.runner_class", default=None)
+    if name in (None, "", "null"):
+        return OnPolicyRunner
+    runner_cls = resolve_callable(str(name))
+    if not isinstance(runner_cls, type):
+        raise TypeError(f"algo.runner_class must resolve to a class, got {runner_cls!r}")
+    return runner_cls
 
 
 def build_ppo_env_cfg_override(cfg: DictConfig) -> dict[str, Any]:
@@ -366,6 +378,7 @@ def play_rsl_rl(cfg: DictConfig, device: str) -> str | None:
         checkpoint_resolver=lambda *_args: str(load_path),
         checkpoint_input_dim_reader=infer_checkpoint_actor_input_dim,
         entrypoint_log_root=get_entrypoint_log_root,
+        runner_cls=_resolve_runner_class(cfg),
         sim2sim_preflight=make_sim2sim_preflight(cfg, algo_name="ppo"),
         guard_algo_name="ppo",
     )
@@ -608,9 +621,10 @@ def main(cfg: DictConfig) -> None:
                         train_cfg["wandb_notes"] = wandb_settings["notes"]
                         train_cfg["wandb_mode"] = wandb_settings["mode"]
 
+                    runner_cls = _resolve_runner_class(cfg)
                     runner = cast(
                         Any,
-                        OnPolicyRunner(
+                        runner_cls(
                             cast(Any, wrapped_env), train_cfg, log_dir=log_dir, device=device
                         ),
                     )
@@ -620,7 +634,22 @@ def main(cfg: DictConfig) -> None:
                         resume_path, _ = parse_checkpoint_path(cfg, root_dir=Path.cwd())
                         if resume_path:
                             print(f"Resuming from {resume_path}")
-                            runner.load(str(resume_path), map_location=device)
+                            reset_optimizer = bool(
+                                OmegaConf.select(
+                                    cfg, "algo.warmstart_reset_optimizer", default=False
+                                )
+                            )
+                            runner.load(
+                                str(resume_path),
+                                load_cfg={
+                                    "actor": True,
+                                    "critic": True,
+                                    "optimizer": not reset_optimizer,
+                                    "iteration": not reset_optimizer,
+                                    "rnd": not reset_optimizer,
+                                },
+                                map_location=device,
+                            )
 
                     initial_timesteps = int(getattr(runner.logger, "tot_timesteps", 0))
                     initial_training_time = float(getattr(runner.logger, "tot_time", 0.0))

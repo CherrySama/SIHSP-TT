@@ -74,6 +74,12 @@ class PlayInteractiveArgs:
     # Physics owner selected by the interactive CLI. MuJoCo remains the viewer
     # implementation for every value, including ``drake``.
     sim: str = "mujoco"
+    # Viewer-only terminal handling. ``immediate`` preserves the standard
+    # autoreset behavior; ``endline`` keeps a successful return visible until
+    # the ball reaches the far short edge.
+    terminal_reset_mode: str = "immediate"
+    terminal_endline_x: float = 1.37
+    terminal_hold_max_steps: int = 300
 
 
 def build_playback_config(args: Any, *, num_envs: int = 1) -> RslRlPlaybackConfig:

@@ -23,13 +23,42 @@ class ReturnShapingCfg:
     net_height_scale: float
     landing_x_scale: float
     landing_y_scale: float
+    target_landing_x: float = 0.75
+    target_landing_y: float = 0.0
+    target_landing_x_scale: float = 0.25
+    target_landing_y_scale: float = 0.25
+    target_landing_y_abs: float = 0.0
+    target_return_apex: float = 0.45
+    target_return_apex_scale: float = 0.06
 
     def __post_init__(self) -> None:
+        scale_names = {
+            "net_height_scale",
+            "landing_x_scale",
+            "landing_y_scale",
+            "target_landing_x_scale",
+            "target_landing_y_scale",
+            "target_return_apex_scale",
+        }
         for name in self.__dataclass_fields__:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value):
                 raise ValueError(f"ReturnShapingCfg {name} must be finite")
-            if value < 0 or (name != "net_clearance" and value == 0):
+            if name in scale_names:
+                invalid = value <= 0
+            else:
+                invalid = value < 0 or (
+                    name
+                    not in {
+                        "net_clearance",
+                        "target_landing_x",
+                        "target_landing_y",
+                        "target_landing_y_abs",
+                        "target_return_apex",
+                    }
+                    and value == 0
+                )
+            if invalid:
                 raise ValueError(f"ReturnShapingCfg {name} has an invalid scale")
 
 
@@ -40,6 +69,12 @@ class OutgoingShot:
     direction: float = 0.0
     net_height: float = 0.0
     landing: float = 0.0
+    target_depth: float = 0.0
+    target_left_edge: float = 0.0
+    target_right_edge: float = 0.0
+    target_short_edge: float = 0.0
+    target_landing: float = 0.0
+    target_return_apex: float = 0.0
     landing_time: float | None = None
     landing_position: tuple[float, float, float] | None = None
     net_position: tuple[float, float, float] | None = None
@@ -85,6 +120,7 @@ def estimate_outgoing_shot(
     flight_time = 2 * (z - surface) / (root - vz) if vz < 0 else (vz + root) / cfg.gravity
     landing_x = x + vx * flight_time
     landing_y = y + vy * flight_time
+    return_apex = z + max(vz, 0.0) ** 2 / (2.0 * cfg.gravity) - geometry.table_z
     low_x = geometry.ball_radius
     high_x = geometry.table_half_length - geometry.ball_radius
     half_y = geometry.table_half_width - geometry.ball_radius
@@ -93,6 +129,27 @@ def estimate_outgoing_shot(
     landing = math.exp(
         -0.5 * ((distance_x / cfg.landing_x_scale) ** 2 + (distance_y / cfg.landing_y_scale) ** 2)
     )
+    x_error = ((landing_x - cfg.target_landing_x) / cfg.target_landing_x_scale) ** 2
+    if cfg.target_landing_y_abs > 0:
+        left_error = ((landing_y + cfg.target_landing_y_abs) / cfg.target_landing_y_scale) ** 2
+        right_error = ((landing_y - cfg.target_landing_y_abs) / cfg.target_landing_y_scale) ** 2
+        y_error = min(left_error, right_error)
+    else:
+        left_error = right_error = (
+            (landing_y - cfg.target_landing_y) / cfg.target_landing_y_scale
+        ) ** 2
+        y_error = left_error
+    target_depth = math.exp(-0.5 * x_error)
+    target_left_edge = math.exp(-0.5 * left_error)
+    target_right_edge = math.exp(-0.5 * right_error)
+    target_short_edge = math.exp(-0.5 * y_error)
+    target_landing = target_depth * target_short_edge
+    # This is an upper bound, not a symmetric target: heights below the
+    # ceiling remain fully acceptable because net_height still supplies the
+    # lower safety constraint.
+    apex_excess = max(return_apex - cfg.target_return_apex, 0.0)
+    apex_error = apex_excess / cfg.target_return_apex_scale
+    target_return_apex = math.exp(-0.5 * apex_error**2)
     # Sample at the complete-sphere exit used by the physical event reducer.
     net_x = geometry.net_half_thickness + geometry.ball_radius
     net_position = None
@@ -121,6 +178,12 @@ def estimate_outgoing_shot(
         direction=direction,
         net_height=net_height,
         landing=landing,
+        target_depth=target_depth,
+        target_left_edge=target_left_edge,
+        target_right_edge=target_right_edge,
+        target_short_edge=target_short_edge,
+        target_landing=target_landing,
+        target_return_apex=target_return_apex,
         landing_time=flight_time,
         landing_position=(landing_x, landing_y, surface),
         net_position=net_position,

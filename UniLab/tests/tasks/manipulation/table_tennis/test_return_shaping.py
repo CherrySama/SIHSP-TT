@@ -56,6 +56,14 @@ def test_net_quality_saturates_once_clearance_is_met():
     assert useful.landing > high.landing
 
 
+def test_target_return_apex_prefers_lower_flight_path():
+    low = estimate_outgoing_shot(POSITION, (4.0, 0.0, 1.0), GEOMETRY, CFG)
+    target = estimate_outgoing_shot(POSITION, (4.0, 0.0, 1.2), GEOMETRY, CFG)
+    high = estimate_outgoing_shot(POSITION, (4.0, 0.0, 2.8), GEOMETRY, CFG)
+    assert low.target_return_apex == pytest.approx(target.target_return_apex)
+    assert low.target_return_apex > high.target_return_apex
+
+
 def test_lateral_escape_and_end_line_overshoot_reduce_feedback():
     useful = estimate_outgoing_shot(POSITION, (4.0, 0.0, 1.8), GEOMETRY, CFG)
     lateral = estimate_outgoing_shot(POSITION, (4.0, 4.0, 1.8), GEOMETRY, CFG)
@@ -64,6 +72,50 @@ def test_lateral_escape_and_end_line_overshoot_reduce_feedback():
     assert useful.landing > lateral.landing
     assert useful.net_height > lateral.net_height
     assert useful.landing > overshoot.landing
+
+
+def test_target_landing_score_prefers_configured_deep_target():
+    target_cfg = replace(CFG, target_landing_x=0.75, target_landing_y=0.0)
+    near_net = estimate_outgoing_shot(POSITION, (3.0, 0.0, 1.8), GEOMETRY, target_cfg)
+    deep = estimate_outgoing_shot(POSITION, (4.0, 0.0, 1.8), GEOMETRY, target_cfg)
+    assert deep.landing_position[0] > near_net.landing_position[0]
+    assert deep.target_landing > near_net.target_landing
+    assert 0.0 <= near_net.target_landing <= 1.0
+    assert 0.0 <= deep.target_landing <= 1.0
+
+
+def test_target_landing_can_choose_either_short_edge_symmetrically():
+    target_cfg = replace(CFG, target_landing_x=0.72, target_landing_y_abs=0.60)
+    left = estimate_outgoing_shot(POSITION, (4.0, -1.0, 1.8), GEOMETRY, target_cfg)
+    right = estimate_outgoing_shot(POSITION, (4.0, 1.0, 1.8), GEOMETRY, target_cfg)
+    center = estimate_outgoing_shot(POSITION, (4.0, 0.0, 1.8), GEOMETRY, target_cfg)
+    assert left.landing_position[1] < 0 < right.landing_position[1]
+    assert left.target_landing == pytest.approx(right.target_landing)
+    assert left.target_landing > center.target_landing
+    assert left.target_short_edge == pytest.approx(right.target_short_edge)
+    assert left.target_short_edge > center.target_short_edge
+    assert left.target_left_edge > left.target_right_edge
+    assert right.target_right_edge > right.target_left_edge
+
+
+def test_depth_and_short_edge_scores_are_separable():
+    target_cfg = replace(CFG, target_landing_x=0.72, target_landing_y_abs=0.60)
+    deep_center = estimate_outgoing_shot(POSITION, (4.0, 0.0, 1.8), GEOMETRY, target_cfg)
+    shallow_center = estimate_outgoing_shot(POSITION, (3.0, 0.0, 1.8), GEOMETRY, target_cfg)
+
+    assert deep_center.target_depth > shallow_center.target_depth
+    assert deep_center.target_short_edge == pytest.approx(shallow_center.target_short_edge)
+    assert deep_center.target_landing == pytest.approx(
+        deep_center.target_depth * deep_center.target_short_edge
+    )
+
+
+def test_target_landing_y_abs_zero_preserves_single_center_target():
+    centered = estimate_outgoing_shot(POSITION, (4.0, 0.0, 1.8), GEOMETRY, CFG)
+    explicit = estimate_outgoing_shot(
+        POSITION, (4.0, 0.0, 1.8), GEOMETRY, replace(CFG, target_landing_y_abs=0.0)
+    )
+    assert explicit.target_landing == pytest.approx(centered.target_landing)
 
 
 def test_backward_departure_retains_prediction_and_receives_negative_direction():

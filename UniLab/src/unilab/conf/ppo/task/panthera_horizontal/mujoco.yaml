@@ -7,9 +7,26 @@ defaults:
 training:
   task_name: PantheraHorizontalReturn
 
+interactive:
+  # Viewer-only behavior: keep successful returns visible through the far
+  # short edge before starting the next serve.
+  terminal_reset_mode: endline
+  terminal_endline_x: 1.37
+  terminal_hold_max_steps: 300
+
 algo:
   experiment_name: panthera_horizontal_return
   actor:
     class_name: unilab.tasks.manipulation.table_tennis.horizontal_policy.ReferenceResidualModel
+    inserted_observation_index: 93
+    action_init_std: [0.05, 0.15, 1.00, 0.80, 0.05, 0.05]
+    reset_action_std_on_load: true
+    reset_action_mean_indices: []
+    lateral_strength_feature_index: 93
+    lateral_strength_start: 0.45454545454545453
+    lateral_strength_full: 1.0
     distribution_cfg:
-      init_std: 0.05
+      init_std: 0.15
+  critic:
+    class_name: unilab.tasks.manipulation.table_tennis.horizontal_policy.ExpandableObservationMLPModel
+    inserted_observation_index: 93

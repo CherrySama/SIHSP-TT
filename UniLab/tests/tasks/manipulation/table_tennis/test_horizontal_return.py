@@ -31,8 +31,41 @@ def test_reference_initialization_is_trainable_and_contract_is_saved():
             "class_name": "rsl_rl.modules.distribution.GaussianDistribution",
             "init_std": 0.05,
         },
+        action_init_std=[0.05, 0.15, 0.25, 0.4, 0.05, 0.05],
+        reset_action_std_on_load=True,
+        reset_action_mean_indices=[3],
     )
     np.testing.assert_array_equal(model(observations).detach().numpy(), np.zeros((4, 6)))
+    np.testing.assert_allclose(
+        model.distribution.std_param.detach().numpy(),
+        [0.05, 0.15, 0.25, 0.4, 0.05, 0.05],
+    )
+    loaded = model.state_dict()
+    loaded["distribution.std_param"] = torch.full((6,), 0.01)
+    loaded["mlp.4.weight"][3] = 1
+    loaded["mlp.4.bias"][3] = 1
+    model.load_state_dict(loaded)
+    np.testing.assert_allclose(
+        model.distribution.std_param.detach().numpy(),
+        [0.05, 0.15, 0.25, 0.4, 0.05, 0.05],
+    )
+    assert torch.count_nonzero(model.mlp[-1].weight[3]) == 0
+    assert model.mlp[-1].bias[3] == 0
+    expanded_observations = TensorDict({"policy": torch.randn(4, 13)}, batch_size=[4])
+    expanded = ReferenceResidualModel(
+        expanded_observations,
+        {"actor": ["policy"]},
+        "actor",
+        6,
+        hidden_dims=[16, 16],
+        distribution_cfg={
+            "class_name": "rsl_rl.modules.distribution.GaussianDistribution",
+            "init_std": 0.05,
+        },
+    )
+    expanded.load_state_dict(model.state_dict())
+    assert expanded.mlp[0].weight.shape[1] == 13
+    assert torch.count_nonzero(expanded.mlp[0].weight[:, -1]) == 0
     loss = (model(observations) - 0.1).square().mean()
     loss.backward()
     assert model.mlp[-1].bias.grad.abs().sum() > 0
@@ -66,16 +99,42 @@ def test_horizontal_owner_is_distinct_and_positive_failure_reward_is_bounded():
     with initialize_config_dir(config_dir=str(directory), version_base="1.3"):
         cfg = compose("config", overrides=["task=panthera_horizontal/mujoco"])
     assert cfg.training.task_name == "PantheraHorizontalReturn"
+    assert cfg.algo.critic.class_name.endswith("ExpandableObservationMLPModel")
+    assert cfg.algo.actor.inserted_observation_index == 93
+    assert cfg.algo.critic.inserted_observation_index == 93
     assert cfg.env.actions.return_control._target_.endswith("HorizontalReturnActionCfg")
+    assert cfg.env.actions.return_control.yaw_residual == pytest.approx(0.05)
+    assert cfg.env.actions.return_control.yaw_residual_velocity == pytest.approx(0.15)
+    assert cfg.env.actions.return_control.yaw_residual_acceleration == pytest.approx(2.0)
+    assert cfg.env.actions.return_control.yaw_boost_residual == pytest.approx(0.05)
+    assert cfg.env.actions.return_control.yaw_boost_velocity == pytest.approx(0.15)
+    assert cfg.env.actions.return_control.yaw_boost_acceleration == pytest.approx(2.0)
+    assert cfg.env.actions.return_control.yaw_profile_offset == pytest.approx(0.115)
+    assert cfg.env.actions.return_control.yaw_boost_profile_offset == pytest.approx(0.225)
+    assert cfg.env.actions.return_control.yaw_profile_side_offset == pytest.approx(0.055)
+    assert cfg.env.actions.return_control.yaw_strength_mode == "positive_continuous_pre_contact"
+    assert cfg.env.actions.return_control.residual_velocity == pytest.approx(0.15)
+    assert cfg.env.actions.return_control.residual_acceleration == pytest.approx(2.0)
     assert cfg.env.observations.policy.terms.return_state.func.endswith("horizontal_observation")
+    assert cfg.env.observations.policy.terms.return_state.params.include_hit_lateral is True
     assert cfg.reward.adjustment_cost.params.component == "residual"
     assert cfg.reward.horizontal_form.weight < 0
+    assert cfg.reward.strength_guidance.weight < 0
+    assert cfg.reward.strength_guidance.params.boost_start_y == pytest.approx(0.25)
+    assert cfg.reward.strength_guidance.params.full_boost_y == pytest.approx(0.55)
+    assert cfg.reward.target_short_edge.func.endswith("return_shaping_reward")
     maximum = (
         cfg.reward.first_hit.weight
         + cfg.reward.crossed_net.weight
         + sum(
             cfg.reward[k].weight
-            for k in ("outgoing_direction", "predicted_net_height", "predicted_landing")
+            for k in (
+                "outgoing_direction",
+                "predicted_net_height",
+                "predicted_landing",
+                "target_depth",
+                "target_short_edge",
+            )
         )
         + (cfg.reward.reaching.weight + cfg.reward.striking.weight) * cfg.env.max_episode_seconds
     )
@@ -133,6 +192,35 @@ def test_clock_action_changes_real_stroke_timing_and_partial_reset_is_local():
         assert control._clock[0] == 0 and not control.ready[0]
         assert control._clock[1] == preserved[0] and control.ready[1]
         np.testing.assert_array_equal(control._reference[1], preserved[1])
+    finally:
+        env.close()
+
+
+def test_policy_selects_yaw_once_and_holds_it_through_contact_window():
+    cfg = build_panthera_horizontal_env_cfg()
+    cfg.auto_reset = False
+    env = make_manager_based_rl_env(cfg, num_envs=2)
+    try:
+        env.init_state()
+        control = env.action_manager.get_term("return_control")
+        actions = np.zeros((2, 6), np.float32)
+        actions[:, 2] = (-0.8, 0.7)
+        actions[:, 3] = (0.6, -0.4)
+        for _ in range(100):
+            env.step(actions)
+            if control.ready.all():
+                break
+        assert control.ready.all()
+        np.testing.assert_array_equal(control._yaw_choice, (-1, 1))
+        np.testing.assert_allclose(control._yaw_strength, (0.6, 0))
+
+        actions[:, 2] *= -1
+        actions[:, 3] = (0.2, 0.9)
+        for _ in range(3):
+            env.step(actions)
+            np.testing.assert_array_equal(control._executed_command[:, 2], (-1, 1))
+            np.testing.assert_allclose(control._yaw_strength, (0.2, 0.9))
+        assert control._residual[0, 1] < 0 < control._residual[1, 1]
     finally:
         env.close()
 

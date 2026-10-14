@@ -7,6 +7,8 @@ env:
       terms:
         return_state:
           func: unilab.tasks.manipulation.table_tennis.horizontal_return.horizontal_observation
+          params:
+            include_hit_lateral: true
   actions:
     return_control:
       _target_: unilab.tasks.manipulation.table_tennis.horizontal_return.HorizontalReturnActionCfg
@@ -15,13 +17,22 @@ env:
       reference_speed_fraction: 0.98
       preparation_position_gain: 100.0
       preparation_side_deadband: 0.005
-      right_stroke: [0.22745269177501676, 0.11708569332581586, 4.116, -0.3883316786975143, 2.9779083225880543, -3.7910165797456505, 0.20389484935300728, 0.34704219797818325, -0.046995586011231896, 0.17263929345218265, 0.03252748905928883, -0.049418363140915224, 0.14086507399377324]
-      left_stroke: [0.22745269177501676, 0.11708569332581586, 4.116, -0.3883316786975143, 2.9779083225880543, -3.7910165797456505, 0.3704875029428004, 0.34704219797818325, -0.046995586011231896, 0.17263929345218265, 0.03252748905928883, -0.049418363140915224, 0.14086507399377324]
+      right_stroke: [0.22745269177501676, 0.11708569332581586, 6.174, -0.582497517, 4.466862, -5.686525, 0.20389484935300728, 0.34704219797818325, -0.046995586011231896, 0.17263929345218265, 0.03252748905928883, -0.049418363140915224, 0.14086507399377324]
+      left_stroke: [0.22745269177501676, 0.11708569332581586, 6.174, -0.582497517, 4.466862, -5.686525, 0.3704875029428004, 0.34704219797818325, -0.046995586011231896, 0.17263929345218265, 0.03252748905928883, -0.049418363140915224, 0.14086507399377324]
       clock_max_rate: 1.02
       clock_acceleration: 5.0
-      yaw_residual: 0.015
+      yaw_residual: 0.05
       arm_residual: 0.015
       tilt_residual: 0.03
+      yaw_residual_velocity: 0.15
+      yaw_residual_acceleration: 2.0
+      yaw_boost_residual: 0.05
+      yaw_boost_velocity: 0.15
+      yaw_boost_acceleration: 2.0
+      yaw_profile_offset: 0.115
+      yaw_boost_profile_offset: 0.225
+      yaw_profile_side_offset: 0.055
+      yaw_strength_mode: positive_continuous_pre_contact
       residual_velocity: 0.15
       residual_acceleration: 2.0
   metrics:
@@ -33,6 +44,12 @@ env:
 # Inherit true-event and incoming/outgoing predictive terms from PantheraReturn.
 # Costs apply only to policy corrections, never to the entire nominal stroke.
 reward:
+  failure:
+    weight: -25.0
+  target_depth:
+    weight: 4.0
+  target_short_edge:
+    weight: 10.0
   adjustment_cost:
     func: unilab.tasks.manipulation.table_tennis.horizontal_return.horizontal_cost
     weight: -0.02
@@ -41,6 +58,13 @@ reward:
     func: unilab.tasks.manipulation.table_tennis.horizontal_return.horizontal_cost
     weight: -0.01
     params: {component: smoothness}
+  strength_guidance:
+    _target_: unilab.managers.RewardTermCfg
+    func: unilab.tasks.manipulation.table_tennis.horizontal_return.horizontal_strength_cost
+    weight: -100.0
+    params:
+      boost_start_y: 0.25
+      full_boost_y: 0.55
   horizontal_form:
     _target_: unilab.managers.RewardTermCfg
     func: unilab.tasks.manipulation.table_tennis.horizontal_return.horizontal_cost

@@ -149,6 +149,9 @@ class ServeLauncherCfg:
             "receiver_peak_range",
         ):
             bounds = getattr(self, name)
+            if isinstance(bounds, list):
+                bounds = tuple(bounds)
+                object.__setattr__(self, name, bounds)
             if (
                 not isinstance(bounds, tuple)
                 or len(bounds) != 2

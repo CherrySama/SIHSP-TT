@@ -74,6 +74,7 @@ env:
       params:
         launcher_cfg:
           _target_: unilab.tasks.manipulation.table_tennis.ball_launcher.ServeLauncherCfg
+          lateral_range: [-0.55, 0.55]
         asset_cfg:
           _target_: unilab.managers.SceneEntityCfg
           name: ball
@@ -128,7 +129,7 @@ reward:
   failure:
     _target_: unilab.managers.RewardTermCfg
     func: unilab.tasks.manipulation.table_tennis.return_control.return_reward
-    weight: -5.0
+    weight: -7.0
     params: {event: failure}
   adjustment_cost:
     _target_: unilab.managers.RewardTermCfg
@@ -164,6 +165,13 @@ reward:
         net_height_scale: 0.18
         landing_x_scale: 0.75
         landing_y_scale: 0.25
+        target_landing_x: 0.72
+        target_landing_y: 0.0
+        target_landing_x_scale: 0.12
+        target_landing_y_scale: 0.25
+        target_landing_y_abs: 0.60
+        target_return_apex: 0.48
+        target_return_apex_scale: 0.06
   predicted_net_height:
     _target_: unilab.managers.RewardTermCfg
     func: unilab.tasks.manipulation.table_tennis.return_control.return_shaping_reward
@@ -177,4 +185,25 @@ reward:
     weight: 1.30
     params:
       component: landing
+      shaping_cfg: *shot_quality
+  target_depth:
+    _target_: unilab.managers.RewardTermCfg
+    func: unilab.tasks.manipulation.table_tennis.return_control.return_shaping_reward
+    weight: 1.0
+    params:
+      component: target_depth
+      shaping_cfg: *shot_quality
+  target_short_edge:
+    _target_: unilab.managers.RewardTermCfg
+    func: unilab.tasks.manipulation.table_tennis.return_control.return_shaping_reward
+    weight: 1.0
+    params:
+      component: target_short_edge
+      shaping_cfg: *shot_quality
+  target_return_apex:
+    _target_: unilab.managers.RewardTermCfg
+    func: unilab.tasks.manipulation.table_tennis.return_control.return_shaping_reward
+    weight: 1.0
+    params:
+      component: target_return_apex
       shaping_cfg: *shot_quality

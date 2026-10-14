@@ -52,6 +52,110 @@ def summarize_episodes(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def summarize_landing(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize observed legal-table landing positions and measured joint speeds."""
+    landed = [
+        record["landing_position"]
+        for record in records
+        if record.get("success") and record.get("landing_position") is not None
+    ]
+    if not landed:
+        return {
+            "landing_samples": 0,
+            "x_mean": None,
+            "x_p10": None,
+            "x_p50": None,
+            "x_p90": None,
+            "x_ge_0_65_rate": 0.0,
+            "x_ge_0_70_rate": 0.0,
+            "abs_y_ge_0_45_rate": 0.0,
+            "peak_joint_speed_max": None,
+        }
+    positions = np.asarray(landed, dtype=float)
+    x_values = positions[:, 0]
+    abs_y = np.abs(positions[:, 1])
+    peak_speeds = [
+        max(abs(float(value)) for value in record.get("peak_joint_speed", []))
+        for record in records
+        if record.get("peak_joint_speed")
+    ]
+    return {
+        "landing_samples": int(len(positions)),
+        "x_mean": float(np.mean(x_values)),
+        "x_p10": float(np.percentile(x_values, 10)),
+        "x_p50": float(np.percentile(x_values, 50)),
+        "x_p90": float(np.percentile(x_values, 90)),
+        "threshold_denominator": len(records),
+        "x_ge_0_65_rate": float(np.sum(x_values >= 0.65) / len(records)),
+        "x_ge_0_70_rate": float(np.sum(x_values >= 0.70) / len(records)),
+        "abs_y_ge_0_45_rate": float(np.sum(abs_y >= 0.45) / len(records)),
+        "peak_speed_order": ["rail_joint", "joint1", "joint2", "joint3", "joint4", "joint6"],
+        "peak_speed_per_dof": np.max(
+            [record["peak_joint_speed"] for record in records], axis=0
+        ).tolist(),
+        "peak_joint_speed_max": max(peak_speeds) if peak_speeds else None,
+    }
+
+
+def summarize_paired_comparison(
+    records: list[dict[str, Any]], baseline_records: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Compare policy and baseline records assigned to the same serve ids."""
+    baseline_by_episode = {int(row["episode"]): row for row in baseline_records}
+    policy_ids = [int(row["episode"]) for row in records]
+    if (
+        len(baseline_by_episode) != len(baseline_records)
+        or len(set(policy_ids)) != len(policy_ids)
+        or set(policy_ids) != set(baseline_by_episode)
+    ):
+        raise ValueError("Paired comparison requires identical unique episode ids")
+    pairs = [
+        (row, baseline_by_episode[int(row["episode"])])
+        for row in records
+        if int(row["episode"]) in baseline_by_episode
+    ]
+    x_deltas = []
+    abs_y_deltas = []
+    policy_x65 = baseline_x65 = policy_x70 = baseline_x70 = policy_y45 = baseline_y45 = 0
+    for policy, baseline in pairs:
+        for field in ("launch_position", "launch_velocity"):
+            if not np.allclose(policy[field], baseline[field], rtol=0, atol=2e-6):
+                raise ValueError(f"Paired serve mismatch: {policy['episode']} {field}")
+        policy_landing = policy.get("landing_position")
+        baseline_landing = baseline.get("landing_position")
+        if policy_landing is None or baseline_landing is None:
+            continue
+        x_deltas.append(float(policy_landing[0]) - float(baseline_landing[0]))
+        abs_y_deltas.append(abs(float(policy_landing[1])) - abs(float(baseline_landing[1])))
+        policy_x65 += policy_landing[0] >= 0.65
+        baseline_x65 += baseline_landing[0] >= 0.65
+        policy_x70 += policy_landing[0] >= 0.70
+        baseline_x70 += baseline_landing[0] >= 0.70
+        policy_y45 += abs(policy_landing[1]) >= 0.45
+        baseline_y45 += abs(baseline_landing[1]) >= 0.45
+    return {
+        "paired_samples": len(pairs),
+        "policy_success_rate": float(np.mean([bool(row["success"]) for row, _ in pairs]))
+        if pairs
+        else 0.0,
+        "baseline_success_rate": float(
+            np.mean([bool(row["success"]) for _, row in pairs])
+        )
+        if pairs
+        else 0.0,
+        "landing_pairs": len(x_deltas),
+        "mean_x_delta_policy_minus_baseline": float(np.mean(x_deltas)) if x_deltas else None,
+        "mean_abs_y_delta_policy_minus_baseline": float(np.mean(abs_y_deltas))
+        if abs_y_deltas
+        else None,
+        "x_ge_0_65_rate_delta": (policy_x65 - baseline_x65) / len(pairs) if pairs else 0.0,
+        "x_ge_0_70_rate_delta": (policy_x70 - baseline_x70) / len(pairs) if pairs else 0.0,
+        "abs_y_ge_0_45_rate_delta": (policy_y45 - baseline_y45) / len(pairs)
+        if pairs
+        else 0.0,
+    }
+
+
 def summarize_feed_bins(
     records: list[dict[str, Any]], *, field: str, coordinate: int, edges: list[float]
 ) -> dict[str, Any]:
@@ -121,18 +225,26 @@ def _compose_config(checkpoint: Path | None, task: str = "panthera_return/mujoco
             and saved_config.get("training", {}).get("task_name") != "PantheraHorizontalReturn"
         ):
             raise ValueError("Explicit horizontal task conflicts with checkpoint task")
+        # Research checkpoints may add runner/predictor fields that are not in
+        # the stable base schema; the checkpoint's run_config is authoritative.
+        OmegaConf.set_struct(cfg, False)
         cfg = OmegaConf.merge(cfg, saved_config)
         if (
             cfg.training.task_name not in {"PantheraReturn", "PantheraHorizontalReturn"}
             or cfg.training.sim_backend != "mujoco"
         ):
             raise ValueError("Checkpoint must belong to a Panthera return task on MuJoCo")
+        # ``reset_action_mean_indices`` is a training-only warm-start hook.
+        # Applying it while evaluating would silently erase the actor head from
+        # the checkpoint being measured.
+        cfg.algo.actor.reset_action_mean_indices = []
     return cfg
 
 
 def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     import torch
     from rsl_rl.runners import OnPolicyRunner
+    from rsl_rl.utils import resolve_callable
 
     from unilab.base.config_adapter import BackendAdapter, create_env
     from unilab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
@@ -155,6 +267,23 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     )
     if checkpoint is not None:
         resolve_sim2sim_config(checkpoint.parent, cfg, algo_name="ppo", strict=True)
+    actions_cfg = cfg.env.get("actions")
+    action_cfg = actions_cfg.get("return_control") if actions_cfg is not None else None
+    if action_cfg is not None:
+        for name in (
+            "yaw_residual",
+            "yaw_residual_velocity",
+            "yaw_residual_acceleration",
+            "yaw_boost_residual",
+            "yaw_boost_velocity",
+            "yaw_boost_acceleration",
+            "yaw_profile_offset",
+            "yaw_boost_profile_offset",
+            "yaw_profile_side_offset",
+        ):
+            value = getattr(args, name, None)
+            if value is not None:
+                setattr(action_cfg, name, value)
     cfg.env.seed = args.seed
     cfg.env.auto_reset = False
     env_override = BackendAdapter(cfg, root_dir=Path.cwd()).build_task_env_cfg_override()
@@ -190,7 +319,11 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 env.reset(np.array([env_id], dtype=np.int32))
         policy = None
         if args.mode == "policy":
-            runner = OnPolicyRunner(
+            runner_cls = OnPolicyRunner
+            runner_name = cfg.algo.get("runner_class")
+            if runner_name not in (None, "", "null"):
+                runner_cls = resolve_callable(str(runner_name))
+            runner = runner_cls(
                 cast(Any, wrapped), algo_config_dict(cfg), log_dir=None, device="cpu"
             )
             with policy_load_dim_guard(
@@ -245,10 +378,15 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 else:
                     actions.fill(0.0)
                 actions[episode_ids < 0] = 0.0
-                state = env.step(actions)
-                rewards += state.reward
+                _obs, step_rewards, step_dones, _infos = wrapped.step(actions)
+                timeouts = _infos.get("time_outs")
+                if timeouts is None:
+                    timeouts = np.zeros(env.num_envs, dtype=bool)
+                elif hasattr(timeouts, "cpu"):
+                    timeouts = timeouts.cpu().numpy()
+                rewards += step_rewards.cpu().numpy()
                 steps += 1
-                done_ids = np.flatnonzero(state.terminated | state.truncated)
+                done_ids = np.flatnonzero(step_dones.cpu().numpy())
                 for env_id in done_ids:
                     # Inactive slots still share the physics batch. Reset every
                     # terminal slot before its next step, but do not count its
@@ -269,7 +407,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                     report["success"] = bool(report["success"])
                     if not report["success"] and not report.get("failure_reason"):
                         report["failure_reason"] = (
-                            "timeout" if state.truncated[env_id] else "unspecified_failure"
+                            "timeout"
+                            if bool(timeouts[env_id])
+                            else "unspecified_failure"
                         )
                     report.update(
                         episode=int(episode_ids[env_id]),
@@ -300,6 +440,13 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     finally:
         env.close()
     summary = summarize_episodes(records)
+    summary["landing"] = summarize_landing(records)
+    if getattr(args, "compare_dir", None) is not None:
+        baseline_path = args.compare_dir / "episodes.jsonl"
+        if not baseline_path.is_file():
+            raise ValueError(f"Comparison directory lacks episodes.jsonl: {baseline_path}")
+        baseline_records = [json.loads(line) for line in baseline_path.read_text().splitlines()]
+        summary["paired_comparison"] = summarize_paired_comparison(records, baseline_records)
     if any("horizontal_assessment" in row for row in records):
         accepted = sum(
             row.get("horizontal_assessment", {}).get("accepted", False) for row in records
@@ -315,6 +462,25 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         paired_serves=paired,
         seed=args.seed,
         checkpoint=str(checkpoint) if checkpoint is not None else None,
+        action_contract=(
+            {
+                name: float(getattr(action_cfg, name))
+                for name in (
+                    "yaw_residual",
+                    "yaw_residual_velocity",
+                    "yaw_residual_acceleration",
+                    "yaw_boost_residual",
+                    "yaw_boost_velocity",
+                    "yaw_boost_acceleration",
+                    "yaw_profile_offset",
+                    "yaw_boost_profile_offset",
+                    "yaw_profile_side_offset",
+                )
+                if hasattr(action_cfg, name)
+            }
+            if action_cfg is not None
+            else {}
+        ),
         wall_seconds=time.perf_counter() - started,
         sides={
             str(side): summarize_episodes([row for row in records if row.get("side") == side])
@@ -357,6 +523,15 @@ def main() -> None:
     parser.add_argument("--episodes", type=int, default=1000)
     parser.add_argument("--num-envs", type=int, default=32)
     parser.add_argument("--seed", type=int, default=10007)
+    parser.add_argument("--yaw-residual", type=float)
+    parser.add_argument("--yaw-residual-velocity", type=float)
+    parser.add_argument("--yaw-residual-acceleration", type=float)
+    parser.add_argument("--yaw-boost-residual", type=float)
+    parser.add_argument("--yaw-boost-velocity", type=float)
+    parser.add_argument("--yaw-boost-acceleration", type=float)
+    parser.add_argument("--yaw-profile-offset", type=float)
+    parser.add_argument("--yaw-boost-profile-offset", type=float)
+    parser.add_argument("--yaw-profile-side-offset", type=float)
     parser.add_argument(
         "--paired-serves",
         action="store_true",
@@ -365,9 +540,29 @@ def main() -> None:
     parser.add_argument(
         "--output-dir", type=Path, default=Path("artifacts/panthera_return/evaluation")
     )
+    parser.add_argument(
+        "--compare-dir",
+        type=Path,
+        help="Optional zero-action/policy evaluation directory with paired episodes.jsonl",
+    )
     args = parser.parse_args()
     if args.episodes <= 0 or args.num_envs <= 0 or args.seed < 0:
         parser.error("episodes and num-envs must be positive; seed must be non-negative")
+    if any(
+        value is not None and value <= 0
+        for value in (
+            args.yaw_residual,
+            args.yaw_residual_velocity,
+            args.yaw_residual_acceleration,
+            args.yaw_boost_residual,
+            args.yaw_boost_velocity,
+            args.yaw_boost_acceleration,
+            args.yaw_profile_offset,
+            args.yaw_boost_profile_offset,
+            args.yaw_profile_side_offset,
+        )
+    ):
+        parser.error("yaw residual limits must be positive")
     print(json.dumps(evaluate(args), indent=2))
 
 

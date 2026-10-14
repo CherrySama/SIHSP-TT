@@ -41,6 +41,15 @@ class HorizontalReturnActionCfg(PantheraStrokeActionCfg):
     yaw_residual: float = 0.015
     arm_residual: float = 0.015
     tilt_residual: float = 0.03
+    yaw_residual_velocity: float = 0.15
+    yaw_residual_acceleration: float = 2.0
+    yaw_boost_residual: float = 0.25
+    yaw_boost_velocity: float = 1.2
+    yaw_boost_acceleration: float = 16.0
+    yaw_profile_offset: float = 0.12
+    yaw_boost_profile_offset: float = 0.18
+    yaw_profile_side_offset: float = 0.0
+    yaw_strength_mode: str = "binary"
     residual_velocity: float = 0.15
     residual_acceleration: float = 2.0
 
@@ -49,7 +58,7 @@ class HorizontalReturnActionCfg(PantheraStrokeActionCfg):
 
 
 class HorizontalReturnAction(PantheraStrokeAction):
-    """Actions: clock rate, face tilt, yaw, joint2, joint3 and joint4 residuals."""
+    """Actions: clock rate, face tilt, side, side strength, joint3 and joint4 residuals."""
 
     def __init__(self, cfg: HorizontalReturnActionCfg, env: ManagerBasedRlEnv) -> None:
         if (
@@ -63,11 +72,33 @@ class HorizontalReturnAction(PantheraStrokeAction):
             cfg.yaw_residual,
             cfg.arm_residual,
             cfg.tilt_residual,
+            cfg.yaw_residual_velocity,
+            cfg.yaw_residual_acceleration,
+            cfg.yaw_boost_residual,
+            cfg.yaw_boost_velocity,
+            cfg.yaw_boost_acceleration,
+            cfg.yaw_profile_offset,
+            cfg.yaw_boost_profile_offset,
             cfg.residual_velocity,
             cfg.residual_acceleration,
         )
         if any(not np.isfinite(v) or v <= 0 for v in values) or not 1 <= cfg.clock_max_rate <= 1.1:
             raise ValueError("Invalid horizontal clock or residual limits")
+        if not np.isfinite(cfg.yaw_profile_side_offset) or cfg.yaw_profile_side_offset < 0:
+            raise ValueError("Yaw profile side offset must be finite and non-negative")
+        if cfg.yaw_strength_mode not in {
+            "binary",
+            "positive_continuous",
+            "positive_continuous_pre_contact",
+        }:
+            raise ValueError("Invalid yaw strength mode")
+        if (
+            cfg.yaw_boost_residual < cfg.yaw_residual
+            or cfg.yaw_boost_velocity < cfg.yaw_residual_velocity
+            or cfg.yaw_boost_acceleration < cfg.yaw_residual_acceleration
+            or cfg.yaw_boost_profile_offset < cfg.yaw_profile_offset
+        ):
+            raise ValueError("Yaw boost limits must not be below the nominal yaw limits")
         self._horizontal_cfg = cfg
         super().__init__(cfg, env)
         self._profiles = np.asarray([cfg.left_stroke, cfg.right_stroke], dtype=float)
@@ -81,8 +112,20 @@ class HorizontalReturnAction(PantheraStrokeAction):
         self._residual = np.zeros((env.num_envs, 5))
         self._residual_speed = np.zeros_like(self._residual)
         self._residual_accel = np.zeros_like(self._residual)
+        self._yaw_choice = np.full(env.num_envs, np.nan)
+        self._yaw_strength = np.zeros(env.num_envs)
         self._residual_scales = np.array(
             [cfg.tilt_residual, cfg.yaw_residual, *([cfg.arm_residual] * 3)]
+        )
+        self._residual_velocity_scales = np.array(
+            [cfg.residual_velocity, cfg.yaw_residual_velocity, *([cfg.residual_velocity] * 3)]
+        )
+        self._residual_acceleration_scales = np.array(
+            [
+                cfg.residual_acceleration,
+                cfg.yaw_residual_acceleration,
+                *([cfg.residual_acceleration] * 3),
+            ]
         )
         # Cold FK envelope for this reach branch, replacing the original arm
         # branch. A bounding box is predictive guidance, not a reachability proof.
@@ -107,10 +150,57 @@ class HorizontalReturnAction(PantheraStrokeAction):
         self._clock_acceleration[ids] = 0
         self._clock_updated[ids] = -np.inf
         self._residual[ids] = self._residual_speed[ids] = self._residual_accel[ids] = 0
+        self._yaw_choice[ids] = np.nan
+        self._yaw_strength[ids] = 0
+
+    def _apply_yaw_profile(self, i: int) -> None:
+        if not np.isfinite(self._yaw_choice[i]) or not np.isfinite(self._yaw_strength[i]):
+            return
+        side_offset = (
+            self._horizontal_cfg.yaw_profile_side_offset if self._yaw_choice[i] < 0 else 0.0
+        )
+        offset = self._horizontal_cfg.yaw_profile_offset + side_offset + self._yaw_strength[i] * (
+            self._horizontal_cfg.yaw_boost_profile_offset
+            - self._horizontal_cfg.yaw_profile_offset
+        )
+        self.strokes[i, 9] += -self.side[i] * self._yaw_choice[i] * offset
+
+    def _nominal_stroke(self, i: int) -> np.ndarray:
+        side = int(self.side[i] > 0)
+        return self._profiles[side].copy()
+
+    def _commit_yaw_choice(self, i: int, flight: bool) -> None:
+        """Hold one side while a separate non-negative action controls its strength."""
+        new_choice = False
+        if not flight and not np.isfinite(self._yaw_choice[i]):
+            self._yaw_choice[i] = np.sign(self._command[i, 2])
+            new_choice = True
+        if not flight and self._horizontal_cfg.yaw_strength_mode.endswith("pre_contact"):
+            self._yaw_strength[i] = float(np.clip(self._command[i, 3], 0.0, 1.0))
+            self.strokes[i] = self._nominal_stroke(i)
+            self._apply_yaw_profile(i)
+        elif new_choice:
+            self._yaw_strength[i] = (
+                float(np.clip(self._command[i, 3], 0.0, 1.0))
+                if self._horizontal_cfg.yaw_strength_mode == "positive_continuous"
+                else float(self._command[i, 3] > 0)
+            )
+            self._apply_yaw_profile(i)
+        if not flight:
+            self._command[i, 2] = self._yaw_choice[i]
+
+    def apply_actions(self) -> None:
+        for i, episode in enumerate(self.episodes):
+            if self.ready[i]:
+                self._commit_yaw_choice(i, episode.outgoing_time is not None)
+        super().apply_actions()
 
     def process_actions(self, actions: np.ndarray) -> None:
         super().process_actions(actions)
-        self.strokes[:] = self._profiles[(self.side > 0).astype(int)]
+        for i in range(self._env.num_envs):
+            self.strokes[i] = self._nominal_stroke(i)
+        for i in range(self._env.num_envs):
+            self._apply_yaw_profile(i)
 
     def _update_guidance(self) -> None:
         PantheraReturnAction._update_guidance(self)
@@ -139,15 +229,30 @@ class HorizontalReturnAction(PantheraStrokeAction):
         self, i: int, joint: int, position: float, velocity: float, acceleration: float
     ) -> None:
         column = joint  # yaw/2/3/4 correspond to residual columns 1/2/3/4.
-        cfg = self._horizontal_cfg
         dt = self._env.physics_dt
-        target = self._residual_scales[column] * self._executed_command[i, column + 1]
+        target_scale = self._residual_scales[column]
+        velocity_limit = self._residual_velocity_scales[column]
+        acceleration_limit = self._residual_acceleration_scales[column]
+        if column == 1:
+            strength = self._yaw_strength[i]
+            target_scale += strength * (self._horizontal_cfg.yaw_boost_residual - target_scale)
+            velocity_limit += strength * (
+                self._horizontal_cfg.yaw_boost_velocity - velocity_limit
+            )
+            acceleration_limit += strength * (
+                self._horizontal_cfg.yaw_boost_acceleration - acceleration_limit
+            )
+        target = (
+            0.0
+            if column == 2
+            else target_scale * self._executed_command[i, column + 1]
+        )
         previous = self._residual_speed[i, column]
         goal = np.clip(
-            20 * (target - self._residual[i, column]), -cfg.residual_velocity, cfg.residual_velocity
+            20 * (target - self._residual[i, column]), -velocity_limit, velocity_limit
         )
         speed = previous + np.clip(
-            goal - previous, -cfg.residual_acceleration * dt, cfg.residual_acceleration * dt
+            goal - previous, -acceleration_limit * dt, acceleration_limit * dt
         )
         offset = np.clip(
             self._residual[i, column] + speed * dt,
@@ -201,20 +306,30 @@ class HorizontalReturnAction(PantheraStrokeAction):
         report["clock_time"] = float(self._clock[env_idx])
         report["clock_rate"] = float(self._clock_rate[env_idx])
         report["policy_residual"] = self._residual[env_idx].tolist()
+        report["policy_yaw_choice"] = (
+            float(self._yaw_choice[env_idx]) if np.isfinite(self._yaw_choice[env_idx]) else None
+        )
+        report["policy_yaw_strength"] = float(self._yaw_strength[env_idx])
         return report
 
 
-def horizontal_observation(env: ManagerBasedRlEnv) -> np.ndarray:
+def horizontal_observation(
+    env: ManagerBasedRlEnv,
+    include_hit_lateral: bool = False,
+) -> np.ndarray:
     control = _horizontal_control(env)
-    return np.column_stack(
-        (
-            return_observation(env),
-            control._clock - control.elapsed,
-            control._clock_rate,
-            control._residual / control._residual_scales,
-            control._residual_speed / control._horizontal_cfg.residual_velocity,
-        )
-    ).astype(np.float32)
+    columns: tuple[object, ...] = (
+        return_observation(
+            env,
+        ),
+        control._clock - control.elapsed,
+        control._clock_rate,
+        control._residual / control._residual_scales,
+        control._residual_speed / control._residual_velocity_scales,
+    )
+    if include_hit_lateral:
+        columns += (np.clip(control._predicted_position[:, 1] / 0.55, -1.0, 1.0),)
+    return np.column_stack(columns).astype(np.float32)
 
 
 def _horizontal_control(env: ManagerBasedRlEnv) -> HorizontalReturnAction:
@@ -253,6 +368,26 @@ def horizontal_cost(env: ManagerBasedRlEnv, component: str) -> np.ndarray:
     else:
         raise ValueError(f"Unknown horizontal cost {component!r}")
     return (np.clip(values, 0, 1) * active * env.step_dt).astype(np.float32)
+
+
+def horizontal_strength_cost(
+    env: ManagerBasedRlEnv,
+    boost_start_y: float = 0.25,
+    full_boost_y: float = 0.50,
+) -> np.ndarray:
+    """Penalize strength error without prescribing the selected left/right edge."""
+    if not 0 <= boost_start_y < full_boost_y:
+        raise ValueError("Strength guidance requires 0 <= boost_start_y < full_boost_y")
+    control = _horizontal_control(env)
+    active = control.ready & np.array([e.outgoing_time is None for e in control.episodes])
+    target = np.clip(
+        (np.abs(control._predicted_position[:, 1]) - boost_start_y)
+        / (full_boost_y - boost_start_y),
+        0.0,
+        1.0,
+    )
+    error = (control._yaw_strength - target) ** 2
+    return (error * active * env.step_dt).astype(np.float32)
 
 
 def horizontal_metric(env: ManagerBasedRlEnv) -> np.ndarray:

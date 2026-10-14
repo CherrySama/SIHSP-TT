@@ -308,6 +308,42 @@ def _resolve_focus_body_id(mj_model, env, preferred_name: str) -> int:
     return 1 if nbody > 1 else 0
 
 
+def _resolve_ball_body_id(mj_model) -> int:
+    """Return the MuJoCo body id used for the table-tennis ball, if present."""
+    try:
+        body_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY, "ball")
+    except Exception:
+        body_id = -1
+    return int(body_id)
+
+
+def _env_terminal(env: Any, env_index: int = 0) -> bool:
+    state = getattr(env, "state", None)
+    if state is None:
+        return False
+    terminated = np.asarray(getattr(state, "terminated", ()), dtype=bool).reshape(-1)
+    truncated = np.asarray(getattr(state, "truncated", ()), dtype=bool).reshape(-1)
+    if env_index >= len(terminated) or env_index >= len(truncated):
+        return False
+    return bool(terminated[env_index] or truncated[env_index])
+
+
+def _env_return_succeeded(env: Any, env_index: int = 0) -> bool:
+    """Read the table-tennis success latch without changing task semantics."""
+    action_manager = getattr(env, "action_manager", None)
+    get_term = getattr(action_manager, "get_term", None)
+    if not callable(get_term):
+        return False
+    try:
+        control = get_term("return_control")
+    except Exception:
+        return False
+    episodes = getattr(control, "episodes", None)
+    if episodes is None or env_index >= len(episodes):
+        return False
+    return bool(getattr(episodes[env_index], "success", False))
+
+
 def _has_generated_terrain(env: Any) -> bool:
     scene = getattr(getattr(env, "cfg", None), "scene", None)
     return getattr(scene, "terrain", None) is not None
@@ -974,6 +1010,34 @@ def play_interactive(args, cfg: DictConfig | None = None, *, algo: str | None = 
     state_applier = PhysicsStateApplier(env, mj_model, env_index=0)
     ctrl_dt = env.cfg.ctrl_dt
 
+    terminal_reset_mode = str(getattr(args, "terminal_reset_mode", "immediate")).lower()
+    terminal_endline_x = float(getattr(args, "terminal_endline_x", 1.37))
+    terminal_hold_max_steps = max(int(getattr(args, "terminal_hold_max_steps", 300)), 1)
+    hold_success_until_endline = terminal_reset_mode == "endline"
+    ball_body_id = _resolve_ball_body_id(mj_model) if hold_success_until_endline else -1
+    terminal_hold = False
+    terminal_hold_steps = 0
+    if hold_success_until_endline and ball_body_id >= 0:
+        set_autoreset = getattr(env, "set_autoreset", None)
+        if callable(set_autoreset):
+            set_autoreset(False)
+            print(
+                "[play_interactive] Successful returns will reset at "
+                f"the far short edge x>={terminal_endline_x:.3f}."
+            )
+        else:
+            hold_success_until_endline = False
+            print(
+                "[play_interactive] Endline reset requested, but this environment "
+                "does not expose autoreset control; using immediate reset."
+            )
+    elif hold_success_until_endline:
+        hold_success_until_endline = False
+        print(
+            "[play_interactive] Endline reset requested, but body 'ball' was not "
+            "found; using immediate reset."
+        )
+
     playback_session.reset()
     render_velocity_arrows = str(args.action_mode) == "policy" and _should_render_velocity_arrows(
         env, reset_fn=playback_session.reset
@@ -1075,11 +1139,59 @@ def play_interactive(args, cfg: DictConfig | None = None, *, algo: str | None = 
                 if commander is not None and env.state is not None:
                     env.state.info["commands"][:] = commander.command
 
-                playback_session.advance(controls)
+                if terminal_hold:
+                    # ManagerBasedRlEnv intentionally rejects another RL step
+                    # after a terminal result when autoreset is disabled.  At
+                    # this point the viewer owns a copy of the terminal state,
+                    # so advance that MuJoCo copy directly until the far edge.
+                    advanced = controls.consume_step_permission()
+                    if advanced:
+                        for _ in range(int(getattr(env.cfg, "sim_substeps", 1))):
+                            mujoco.mj_step(mj_model, viz_data)
+                else:
+                    advanced = playback_session.advance(controls)
 
-                # Push env state[0] into viz_data and refresh scene
-                phys = playback_session.physics_state()[0]
-                state_applier.apply(phys, viz_data)
+                    # Push env state[0] into viz_data and refresh scene
+                    phys = playback_session.physics_state()[0]
+                    state_applier.apply(phys, viz_data)
+
+                # Keep only successful table-tennis returns alive after the
+                # first legal landing. This is viewer-local: the task still
+                # reports success at the first landing, while the physics
+                # state continues solely for visual inspection.
+                reset_after_terminal = False
+                if hold_success_until_endline and advanced:
+                    if terminal_hold:
+                        terminal_hold_steps += 1
+                        ball_x = float(viz_data.xpos[ball_body_id, 0])
+                        if (
+                            ball_x >= terminal_endline_x
+                            or terminal_hold_steps >= terminal_hold_max_steps
+                        ):
+                            reset_after_terminal = True
+                            print(
+                                "[play_interactive] Resetting after successful return "
+                                f"(ball_x={ball_x:.3f}, hold_steps={terminal_hold_steps})."
+                            )
+                    elif _env_terminal(env) and _env_return_succeeded(env):
+                        terminal_hold = True
+                        terminal_hold_steps = 0
+                        print(
+                            "[play_interactive] Return landed; continuing playback "
+                            "until the far short edge."
+                        )
+                    elif _env_terminal(env):
+                        # Failed returns keep the original immediate-reset
+                        # behavior so an out-of-bounds episode cannot hang the
+                        # viewer waiting for a short-edge crossing.
+                        reset_after_terminal = True
+
+                if reset_after_terminal:
+                    playback_session.reset()
+                    terminal_hold = False
+                    terminal_hold_steps = 0
+                    phys = playback_session.physics_state()[0]
+                    state_applier.apply(phys, viz_data)
 
                 primitives: list[DebugPrimitive] = []
                 if overlay.enabled:
@@ -1206,6 +1318,15 @@ def _build_play_args(cfg: DictConfig, *, algo: str = "ppo") -> PlayInteractiveAr
         ),
         algo=algo,
         sim=str(OmegaConf.select(cfg, "training.sim_backend", default="mujoco")),
+        terminal_reset_mode=str(
+            OmegaConf.select(cfg, "interactive.terminal_reset_mode", default="immediate")
+        ),
+        terminal_endline_x=float(
+            OmegaConf.select(cfg, "interactive.terminal_endline_x", default=1.37)
+        ),
+        terminal_hold_max_steps=int(
+            OmegaConf.select(cfg, "interactive.terminal_hold_max_steps", default=300)
+        ),
     )
 
 

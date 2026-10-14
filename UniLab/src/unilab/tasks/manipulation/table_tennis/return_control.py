@@ -797,7 +797,15 @@ def return_shaping_reward(
     """Give bounded continuous shot feedback once, after the contact ends."""
     from unilab.tasks.manipulation.table_tennis.return_shaping import estimate_outgoing_shot
 
-    if component not in {"direction", "net_height", "landing"}:
+    if component not in {
+        "direction",
+        "net_height",
+        "landing",
+        "target_depth",
+        "target_short_edge",
+        "target_landing",
+        "target_return_apex",
+    }:
         raise ValueError(f"Unknown shot-quality component {component!r}")
     values = np.zeros(env.num_envs, dtype=np.float32)
     for i, episode in enumerate(_control(env).episodes):
