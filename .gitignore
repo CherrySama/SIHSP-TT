@@ -35,5 +35,5 @@ runs/
 .idea/
 .vscode/
 .codex/
-docs/
-runs/
+# docs/
+# runs/
